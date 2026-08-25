@@ -41,11 +41,40 @@ def proposal_front_matter(pid: str, title: str, status: str = "candidate",
     return meta
 
 
-def write_proposal(proposals_dir: Path | str, meta: Dict[str, Any], body_md: str) -> Path:
-    path = Path(proposals_dir) / f"{meta['id']}.md"
+def write_proposal(proposals_dir: Path | str, meta: Dict[str, Any], body_md: str,
+                   filename: Optional[str] = None) -> Path:
+    """落盘一个 proposal；缺省按 meta['id'] 命名（accepted_proposal.md 等
+    固定名制品通过 filename 指定）。"""
+    path = Path(proposals_dir) / (filename or f"{meta['id']}.md")
     fm = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False)
     path.write_text(f"---\n{fm}---\n\n{body_md.lstrip()}", encoding="utf-8")
     return path
+
+
+def load_hypotheses(path: Path | str) -> List[Dict[str, Any]]:
+    """读 proposals/hypotheses.json 的 hypotheses 数组（缺文件/坏结构返回 []）。"""
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    items = data.get("hypotheses", []) if isinstance(data, dict) else []
+    return [d for d in items if isinstance(d, dict)]
+
+
+def load_cards(path: Path | str) -> List[Dict[str, Any]]:
+    """读 survey_cards.json 的 cards 数组（缺文件/坏结构返回 []）。"""
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    cards = data.get("cards", []) if isinstance(data, dict) else []
+    return [d for d in cards if isinstance(d, dict)]
 
 
 def parse_proposal(path: Path | str) -> Dict[str, Any]:

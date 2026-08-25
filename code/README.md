@@ -17,7 +17,7 @@ python code/main.py --topic agent_context --dry-run
 # 空跑 + 3 次真实极小调用（验证计量流水）
 python code/main.py --topic agent_context --dry-run --smoke
 
-# 只跑 ideation 阶段（D2 实装：Survey + Hypothesis 真实运行）
+# 只跑 ideation 阶段（D2 实装：Survey + Hypothesis + Peer 质询 + Gate 打分）
 python code/main.py --topic agent_context --stages ideation
 
 # 单测（全离线 mock，无网络依赖）
@@ -37,7 +37,9 @@ python -m pytest code/tests -q
 | `minifars/llm.py` | LLM 客户端（Anthropic 协议，全部调用经计量中间件） | §6.2 |
 | `minifars/pipeline.py` | `paper_pipeline` 顶层编排（四阶段串行，阶段间只传制品路径） | §4.2 |
 | `minifars/survey.py` | **SurveyAgent**：arXiv/S2 检索 → 文献卡片 + 研究空白清单（light 档） | §5.1 |
-| `minifars/hypothesis.py` | **HypothesisAgent**：空白清单 → 5~8 候选假设 P0xx.md（strong 档） | §5.1 |
+| `minifars/hypothesis.py` | **HypothesisAgent**：空白清单 → 5~8 候选假设 P0xx.md + 辩论精炼 refine（strong 档） | §5.1 |
+| `minifars/peer.py` | **PeerAgent**：本地新颖性查重线索 + 同行质询 peer_review_r{n}.json（strong 档） | §5.1 |
+| `minifars/gate.py` | **GateAgent**：四维 rubric 打分 + 域约束硬检查，消费 PR1 QualityGate 组件（含熔断），出口 accepted_proposal.md | §5.1 |
 | `scripts/verify_apis.py` | 文献检索 API 连通性验证（arXiv / Semantic Scholar） | §5.1 |
 
 ## 约定
@@ -55,3 +57,6 @@ python -m pytest code/tests -q
   Semantic Scholar 公共池持续 429 限流，需申请免费 API key 或降级 arXiv 单源。
 - LaTeX 工具链：tectonic 0.17.0（conda 安装于 JiuwenSwarm 环境 `Library\bin`），
   ICLR 风格冒烟编译通过（数学/表格/引用/交叉引用，产物在 `tools/latex_smoke/`，不入库）。
+- GateAgent 依赖 `jiuwenswarm.common.quality_gate`（PR1 组件）：经 JiuwenSwarm 环境
+  的 workswarm 可编辑安装引入，无需额外配置；Ideation 熔断语义 = 连续 3 轮无候选
+  过门 → 强制放行最高分（`accepted_proposal.md` front-matter `status=forced_accept`）。

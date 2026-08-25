@@ -21,9 +21,11 @@ from . import STAGES
 from .artifacts import (blueprint_skeleton, proposal_front_matter, run_meta,
                         write_proposal, write_result)
 from .config import PipelineConfig, load_env
+from .gate import GateAgent
 from .hypothesis import HypothesisAgent
 from .llm import LLMClient, build_client
 from .metering import MeteringMiddleware
+from .peer import PeerAgent
 from .survey import SurveyAgent
 from .workspace import STAGE_DIRS, commit_stage
 
@@ -44,19 +46,29 @@ class StageContext:
 
 # ------------------------------------------------------------------ stages
 def stage_ideation(ctx: StageContext, client: Optional[LLMClient] = None) -> Dict[str, str]:
-    """Ideation Swarm（§5.1）：SurveyAgent 检索 → HypothesisAgent 生成候选假设。
+    """Ideation Swarm（§5.1）：Survey → Hypothesis → Peer 质询 → Gate 打分。
 
-    D2 实装：产出 proposals/survey/{survey_cards,research_gaps} + P0xx.md +
-    hypotheses.json；D2 下午接 PeerAgent 质询与 GateAgent 打分。
+    D2 完整闭环：SurveyAgent 检索 → HypothesisAgent 生成候选 →
+    PeerAgent 质询 →（不过门时 Lead 辩论精炼）→ GateAgent 打分过门，
+    最多 max_rounds 轮；连续无候选过门由 QualityGate 熔断强制放行
+    最高分草案（防精炼死循环）。出口制品 accepted_proposal.md。
     """
     proposals_dir = ctx.project / STAGE_DIRS["ideation"]
+    proposals_dir.mkdir(parents=True, exist_ok=True)  # 幂等：支持脱离编排器单测
     if ctx.dry_run:
         meta = proposal_front_matter("P001", title=f"candidate-{ctx.topic.get('name')}",
                                      status="candidate")
         body = (f"# [dry-run] 占位假设\n\n主题：{ctx.topic.get('name')}\n\n"
                 "真实运行由 SurveyAgent/HypothesisAgent 生成候选。\n")
         path = write_proposal(proposals_dir, meta, body)
-        return {"proposals": str(path)}
+        acc_meta = proposal_front_matter("P001", title=f"accepted-{ctx.topic.get('name')}",
+                                         status="accepted",
+                                         extra={"source": "dry_run"})
+        acc_body = ("# [dry-run] 占位立项报告\n\n"
+                    "真实运行由 PeerAgent 质询 + GateAgent 打分产出。\n")
+        acc_path = write_proposal(proposals_dir, acc_meta, acc_body,
+                                  filename="accepted_proposal.md")
+        return {"accepted": str(acc_path), "proposals": str(path)}
 
     survey = SurveyAgent(ctx.topic, ctx.llm_light,
                          out_dir=proposals_dir / "survey",
@@ -65,8 +77,26 @@ def stage_ideation(ctx: StageContext, client: Optional[LLMClient] = None) -> Dic
     produced = survey.run()
     hypo = HypothesisAgent(ctx.topic, ctx.llm_strong, proposals_dir)
     produced.update(hypo.run(gaps_path=produced["research_gaps"]))
-    # 主制品（ctx.artifacts['ideation']）= hypotheses.json，下游 planning 引用
-    primary = {"hypotheses": produced["hypotheses"]}
+
+    # D2 下午：PeerAgent 质询 → Lead 精炼 → GateAgent 打分（§5.1 闭环）
+    peer = PeerAgent(ctx.topic, ctx.llm_strong, proposals_dir)
+    gate = GateAgent(ctx.topic, ctx.llm_strong, proposals_dir)
+    decision = None
+    for round_no in range(1, gate.max_rounds + 1):
+        peer_res = peer.review(produced["hypotheses"], produced["survey_cards"],
+                               round_no)
+        decision, _ = gate.review(produced["hypotheses"], round_no)
+        if decision.passed:
+            break
+        if round_no < gate.max_rounds:
+            hypo.refine(peer_res["items"], gate_feedback={
+                "weighted": decision.weighted, "reason": decision.reason,
+                "threshold": gate.threshold})
+    accepted = gate.accept(decision, produced["hypotheses"])
+
+    # 主制品（ctx.artifacts['ideation']）= accepted_proposal.md，
+    # 下游 planning 从此翻译实验契约；hypotheses.json 等一并交接
+    primary = {"accepted": str(accepted), "hypotheses": produced["hypotheses"]}
     primary.update(produced)
     return primary
 

@@ -19,7 +19,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .artifacts import proposal_front_matter, write_proposal
 from .llm import LLMClient
@@ -91,22 +91,55 @@ class HypothesisAgent:
         items = [it for it in items if not _missing_fields(it)][:MAX_HYPOTHESES]
 
         self.proposals_dir.mkdir(parents=True, exist_ok=True)
+        paths, summary_path = self._persist(items, source="hypothesis_agent")
+        print(f"[hypothesis] {len(items)} 个候选假设（"
+              f"校验问题: {self._validation_of(items) or '无'}）")
+        return {"hypotheses": str(summary_path), "proposals": paths}
+
+    def refine(self, peer_items: List[Dict[str, Any]],
+               gate_feedback: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Lead 辩论精炼（§5.1）：按同行质询 + Gate 反馈修订当前候选。
+
+        无 LLM（离线）时恒等返回；修订产出不足 MIN_HYPOTHESES 条时保留原稿。
+        """
+        data = json.loads((self.proposals_dir / "hypotheses.json")
+                          .read_text(encoding="utf-8"))
+        items = [d for d in data.get("hypotheses", []) if isinstance(d, dict)]
+        if self.llm is None:
+            print("[hypothesis] refine：离线模式跳过修订（恒等）")
+            return items
+        revised = self._refine_generate(items, peer_items, gate_feedback or {})
+        revised = [it for it in revised if not _missing_fields(it)][:MAX_HYPOTHESES]
+        if len(revised) < MIN_HYPOTHESES:
+            print(f"[hypothesis] refine：修订产出 {len(revised)} 条不足 "
+                  f"{MIN_HYPOTHESES}，保留原稿")
+            return items
+        self._persist(revised, source="hypothesis_agent_refine")
+        print(f"[hypothesis] refine：{len(items)} -> {len(revised)} 条候选")
+        return revised
+
+    # ------------------------------------------------------------ internals
+    def _persist(self, items: List[Dict[str, Any]],
+                 source: str) -> Tuple[List[str], Path]:
+        """重写 P0xx.md + hypotheses.json（refine 后数量可能缩水，先清旧 P*.md）。"""
+        for old in self.proposals_dir.glob("P*.md"):
+            old.unlink()
         paths: List[str] = []
         for idx, item in enumerate(items, start=1):
             pid = f"P{idx:03d}"
-            body = self._body_md(item)
             meta = proposal_front_matter(
                 pid, title=item.get("title", ""),
                 status="candidate",
                 extra={"sub_direction": item.get("sub_direction", ""),
-                       "source": "hypothesis_agent"})
-            path = write_proposal(self.proposals_dir, meta, body)
-            paths.append(str(path))
+                       "source": source})
+            paths.append(str(write_proposal(self.proposals_dir, meta,
+                                            self._body_md(item))))
 
         summary = {
             "schema": "v0",
             "topic": self.topic.get("name"),
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "source": source,
             "count": len(items),
             "validation": validate_hypotheses(items),
             "hypotheses": items,
@@ -114,11 +147,47 @@ class HypothesisAgent:
         summary_path = self.proposals_dir / "hypotheses.json"
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2),
                                 encoding="utf-8")
-        print(f"[hypothesis] {len(items)} 个候选假设（"
-              f"校验问题: {summary['validation'] or '无'}）")
-        return {"hypotheses": str(summary_path), "proposals": paths}
+        return paths, summary_path
 
-    # ------------------------------------------------------------ internals
+    @staticmethod
+    def _validation_of(items: List[Dict[str, Any]]) -> List[str]:
+        return validate_hypotheses(items)
+
+    def _refine_generate(self, items: List[Dict[str, Any]],
+                         peer_items: List[Dict[str, Any]],
+                         feedback: Dict[str, Any]) -> List[Dict[str, Any]]:
+        weighted = feedback.get("weighted", {})
+        hypo_lines: List[str] = []
+        for it in items:
+            hid = str(it.get("id", ""))
+            w = weighted.get(hid)
+            hypo_lines.append(
+                f"- id={hid}（gate 加权分 {f'{w:.2f}' if w is not None else '未评'}）\n"
+                f"  标题：{it.get('title', '')}\n"
+                f"  预测：{str(it.get('testable_prediction', ''))[:GAPS_INPUT_LIMIT // 8]}\n"
+                f"  实验：{str(it.get('minimal_experiment', ''))[:GAPS_INPUT_LIMIT // 8]}")
+        peer_lines = [
+            f"- {r.get('id', '')}：新颖性担忧={r.get('novelty_concern', '')}；"
+            f"主要弱点={r.get('major_weakness', '')}；建议={r.get('suggested_fix', '')}"
+            for r in peer_items]
+        prompt = (
+            f"研究主题：{self.topic.get('title') or self.topic.get('name')}\n"
+            f"算力预算（硬约束）：{json.dumps(self.topic.get('budget') or {}, ensure_ascii=False)}\n\n"
+            "当前候选假设（含 GateAgent 加权分）：\n" + "\n".join(hypo_lines) + "\n\n"
+            "同行质询意见（PeerAgent）：\n" + "\n".join(peer_lines) + "\n\n"
+            f"GateAgent 判定：无候选达到阈值（{feedback.get('reason', '')}）。\n\n"
+            "请修订候选假设：逐条解决质询指出的弱点与低分维度（新颖性重叠、"
+            "预测不可量化、实验超预算等），可合并/替换/新增。保持 "
+            f"{MIN_HYPOTHESES}~{MAX_HYPOTHESES} 个，字段 schema 不变：\n"
+            '{"id": "H1", "title": "一句话标题", "problem_statement": "问题陈述", '
+            '"testable_prediction": "可量化验证的预测", '
+            '"minimal_experiment": "所需最小实验", "sub_direction": "所属子方向"}\n'
+            "只输出 JSON 数组，不要其他文字。"
+        )
+        cli = self.llm.bind("ideation", "hypothesis_lead")
+        resp = cli.chat(prompt, system=HYPOTHESIS_SYSTEM, max_tokens=6144)
+        return extract_json_array(LLMClient.text_of(resp))
+
     def _generate(self, gaps: str) -> List[Dict[str, Any]]:
         budget = self.topic.get("budget") or {}
         prompt = (
