@@ -30,6 +30,7 @@ python code/main.py --topic agent_context --dry-run --smoke
 | `minifars/metering.py` | **MeteringMiddleware**：token/时长/成本流水（PR2 候选） | §6.2、§7 |
 | `minifars/llm.py` | LLM 客户端（Anthropic 协议，全部调用经计量中间件） | §6.2 |
 | `minifars/pipeline.py` | `paper_pipeline` 顶层编排（四阶段串行，阶段间只传制品路径） | §4.2 |
+| `scripts/verify_apis.py` | 文献检索 API 连通性验证（arXiv / Semantic Scholar） | §5.1 |
 
 ## 约定
 
@@ -42,3 +43,7 @@ python code/main.py --topic agent_context --dry-run --smoke
 
 - MiniMax-M2 响应含 `thinking` 块且与正文共享 `max_tokens` 预算：预算过小时正文可能为空，
   `LLMClient.text_of()` 已做兜底，正式调用请按任务给足预算。
+- 文献检索（2026-08-25 实测）：arXiv API 可用（https + follow_redirects）；
+  Semantic Scholar 公共池持续 429 限流，需申请免费 API key 或降级 arXiv 单源。
+- LaTeX 工具链：tectonic 0.17.0（conda 安装于 JiuwenSwarm 环境 `Library\bin`），
+  ICLR 风格冒烟编译通过（数学/表格/引用/交叉引用，产物在 `tools/latex_smoke/`，不入库）。
