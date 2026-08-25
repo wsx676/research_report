@@ -31,6 +31,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="附带 3 次真实极小 LLM 调用（验证计量流水，token 消耗可忽略）")
     p.add_argument("--project-id", default=None,
                    help="复用已有项目目录（断点续跑）；缺省按主题+时间新建")
+    p.add_argument("--stages", default=None,
+                   help="只跑指定阶段（逗号分隔，如 ideation）；默认全部四阶段")
     p.add_argument("--workspace-root", default=None, help="覆盖 config.yaml 的工作区根目录")
     p.add_argument("--config", default=None, help="config.yaml 路径（默认 code/config.yaml）")
     return p.parse_args(argv)
@@ -50,9 +52,16 @@ def main(argv=None) -> int:
     project = init_workspace(ws_root, project_id, topic_file=topic_path)
     print(f"[main] workspace ready: {project}")
 
+    stages = [s.strip() for s in args.stages.split(",")] if args.stages else None
+    if stages:
+        from minifars import STAGES
+        bad = [s for s in stages if s not in STAGES]
+        if bad:
+            raise SystemExit(f"[main] 未知阶段 {bad}，可选：{list(STAGES)}")
+
     pipe = PaperPipeline(project, topic, config,
                          dry_run=args.dry_run, smoke=args.smoke)
-    artifacts = pipe.run()
+    artifacts = pipe.run(stages=stages)
 
     summary = pipe.metering.summarize()
     print("[main] metering total:", json.dumps(summary["total"], ensure_ascii=False))

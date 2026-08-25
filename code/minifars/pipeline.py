@@ -21,8 +21,10 @@ from . import STAGES
 from .artifacts import (blueprint_skeleton, proposal_front_matter, run_meta,
                         write_proposal, write_result)
 from .config import PipelineConfig, load_env
+from .hypothesis import HypothesisAgent
 from .llm import LLMClient, build_client
 from .metering import MeteringMiddleware
+from .survey import SurveyAgent
 from .workspace import STAGE_DIRS, commit_stage
 
 
@@ -34,26 +36,39 @@ class StageContext:
     topic: Dict
     artifacts: Dict[str, str] = field(default_factory=dict)  # stage -> 主制品路径
     dry_run: bool = True
+    llm_strong: Optional[LLMClient] = None   # 假设生成/写作（strong 档）
+    llm_light: Optional[LLMClient] = None    # 摘要/格式校验（light 档，§6.2 分级路由）
+    metering: Optional[MeteringMiddleware] = None
+    env: Dict[str, str] = field(default_factory=dict)
 
 
 # ------------------------------------------------------------------ stages
-def stage_ideation(ctx: StageContext, client: Optional[LLMClient]) -> Dict[str, str]:
-    """Ideation Swarm（D2 实装）：产出候选假设 proposals/*.md。"""
+def stage_ideation(ctx: StageContext, client: Optional[LLMClient] = None) -> Dict[str, str]:
+    """Ideation Swarm（§5.1）：SurveyAgent 检索 → HypothesisAgent 生成候选假设。
+
+    D2 实装：产出 proposals/survey/{survey_cards,research_gaps} + P0xx.md +
+    hypotheses.json；D2 下午接 PeerAgent 质询与 GateAgent 打分。
+    """
     proposals_dir = ctx.project / STAGE_DIRS["ideation"]
-    pid = "P001"
-    if ctx.dry_run or client is None:
+    if ctx.dry_run:
+        meta = proposal_front_matter("P001", title=f"candidate-{ctx.topic.get('name')}",
+                                     status="candidate")
         body = (f"# [dry-run] 占位假设\n\n主题：{ctx.topic.get('name')}\n\n"
-                "D2 将由 SurveyAgent/HypothesisAgent 生成真实候选。\n")
-    else:
-        cli = client.bind("ideation", "hypothesis_lead")
-        resp = cli.chat(
-            f"针对研究方向「{ctx.topic.get('name')}」，用一句话提出一个可验证的候选假设。",
-            max_tokens=64)
-        body = f"# 候选假设 P001\n\n{LLMClient.text_of(resp)}\n"
-    meta = proposal_front_matter(pid, title=f"candidate-{ctx.topic.get('name')}",
-                                 status="candidate")
-    path = write_proposal(proposals_dir, meta, body)
-    return {"proposals": str(path)}
+                "真实运行由 SurveyAgent/HypothesisAgent 生成候选。\n")
+        path = write_proposal(proposals_dir, meta, body)
+        return {"proposals": str(path)}
+
+    survey = SurveyAgent(ctx.topic, ctx.llm_light,
+                         out_dir=proposals_dir / "survey",
+                         metering=ctx.metering,
+                         s2_api_key=(ctx.env or {}).get("S2_API_KEY"))
+    produced = survey.run()
+    hypo = HypothesisAgent(ctx.topic, ctx.llm_strong, proposals_dir)
+    produced.update(hypo.run(gaps_path=produced["research_gaps"]))
+    # 主制品（ctx.artifacts['ideation']）= hypotheses.json，下游 planning 引用
+    primary = {"hypotheses": produced["hypotheses"]}
+    primary.update(produced)
+    return primary
 
 
 def stage_planning(ctx: StageContext, client: Optional[LLMClient]) -> Dict[str, str]:
@@ -128,18 +143,29 @@ class PaperPipeline:
         self.dry_run = dry_run
         self.smoke = smoke
         self.metering = MeteringMiddleware(project / "metering", prices=config.prices)
-        self.client: Optional[LLMClient] = None
+        self.client: Optional[LLMClient] = None      # strong 档（默认绑定）
+        self.client_light: Optional[LLMClient] = None
+        self.env: Dict[str, str] = {}
         if not dry_run or smoke:
-            env = load_env()
+            self.env = load_env()
             tier = config.tiers.get("strong")
             if tier is None:
                 raise ValueError("config.yaml 缺少 models.strong 分级配置")
-            self.client = build_client(env, tier, self.metering)
+            self.client = build_client(env=self.env, tier=tier,
+                                       metering=self.metering)
+            tier_light = config.tiers.get("light") or tier  # 缺省回落 strong
+            self.client_light = build_client(env=self.env, tier=tier_light,
+                                             metering=self.metering)
 
-    def run(self) -> Dict[str, str]:
-        ctx = StageContext(project=self.project, topic=self.topic, dry_run=self.dry_run)
+    def run(self, stages: Optional[list] | tuple = None) -> Dict[str, str]:
+        """按顺序执行阶段子集（默认全部）；断点续跑由 --project-id 配合实现。"""
+        plan = [s for s in STAGES if not stages or s in stages]
+        ctx = StageContext(project=self.project, topic=self.topic,
+                           dry_run=self.dry_run, llm_strong=self.client,
+                           llm_light=self.client_light, metering=self.metering,
+                           env=self.env)
         t_stage0 = time.perf_counter()
-        for stage in STAGES:
+        for stage in plan:
             t0 = time.perf_counter()
             produced = STAGE_FUNCS[stage](ctx, self.client)
             ctx.artifacts.update({stage: next(iter(produced.values()), "")})

@@ -22,7 +22,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO_ROOT / "code" / "config.yaml"
 
 ENV_KEYS = ("MODEL_PROVIDER", "MODEL_NAME", "API_BASE", "API_KEY",
-            "EMBED_API_BASE", "EMBED_API_KEY", "EMBED_MODEL")
+            "EMBED_API_BASE", "EMBED_API_KEY", "EMBED_MODEL",
+            "S2_API_KEY")  # Semantic Scholar 免费 key（可选，缓解 429 限流）
 
 
 def _parse_env_file(path: Path) -> Dict[str, str]:

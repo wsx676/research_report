@@ -16,6 +16,12 @@ python code/main.py --topic agent_context --dry-run
 
 # 空跑 + 3 次真实极小调用（验证计量流水）
 python code/main.py --topic agent_context --dry-run --smoke
+
+# 只跑 ideation 阶段（D2 实装：Survey + Hypothesis 真实运行）
+python code/main.py --topic agent_context --stages ideation
+
+# 单测（全离线 mock，无网络依赖）
+python -m pytest code/tests -q
 ```
 
 ## 目录
@@ -30,6 +36,8 @@ python code/main.py --topic agent_context --dry-run --smoke
 | `minifars/metering.py` | **MeteringMiddleware**：token/时长/成本流水（PR2 候选） | §6.2、§7 |
 | `minifars/llm.py` | LLM 客户端（Anthropic 协议，全部调用经计量中间件） | §6.2 |
 | `minifars/pipeline.py` | `paper_pipeline` 顶层编排（四阶段串行，阶段间只传制品路径） | §4.2 |
+| `minifars/survey.py` | **SurveyAgent**：arXiv/S2 检索 → 文献卡片 + 研究空白清单（light 档） | §5.1 |
+| `minifars/hypothesis.py` | **HypothesisAgent**：空白清单 → 5~8 候选假设 P0xx.md（strong 档） | §5.1 |
 | `scripts/verify_apis.py` | 文献检索 API 连通性验证（arXiv / Semantic Scholar） | §5.1 |
 
 ## 约定
