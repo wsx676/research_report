@@ -1,0 +1,24 @@
+# 主题 A：Agent 上下文工程（比赛建议主题之一）
+name: agent_context
+title: Context Engineering for LLM Agents
+description: >
+  面向长程 Agent 任务的上下文工程：上下文窗口管理、压缩与蒸馏、
+  外部记忆检索注入、上下文失效的自动检测与恢复。
+
+# 子方向关键词（SurveyAgent 检索用，D2 使用）
+sub_directions:
+  - context window management
+  - context compression and summarization
+  - memory-augmented retrieval for agents
+  - context failure detection and recovery
+
+# 检索过滤器（§D2 风险预案：近 12 个月 + 引用数下限）
+search_filters:
+  months_back: 12
+  min_citations: 0        # 新方向放宽引用门槛
+
+# 算力预算（契约硬约束，D3 使用）
+budget:
+  llm_tokens_total: 1500000     # 本项目 token 上限
+  experiment_wall_clock_min: 120  # 实验总墙钟时间（分钟）
+  seeds_per_task: 2               # 多 seed 并行数（技能库模板）

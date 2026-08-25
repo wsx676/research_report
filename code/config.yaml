@@ -1,0 +1,28 @@
+# miniFARS 流水线配置（§6.2 分级路由 + 计量）
+# 密钥不在此文件：API_BASE/API_KEY 等四件套由 .env 提供
+# （加载顺序：进程环境变量 > <repo>/.env > ~/.jiuwenswarm/.env）
+
+models:
+  # 强模型：假设生成 / 论文写作
+  strong:
+    provider: Anthropic          # MiniMax TokenPlanPlus 订阅 Key 走 Anthropic 协议
+    name: MiniMax-M2
+    max_tokens: 4096
+    temperature: 0.7
+  # 轻量模型：文献摘要 / 格式校验（暂与 strong 同模型，后续换轻量模型省额度）
+  light:
+    provider: Anthropic
+    name: MiniMax-M2
+    max_tokens: 1024
+    temperature: 0.2
+
+metering:
+  # USD / 百万 token；MiniMax 订阅制记 0，成本维度以 token 数为准
+  prices_usd_per_mtok:
+    MiniMax-M2: { input: 0.0, output: 0.0 }
+
+pipeline:
+  stages: [ideation, planning, experiment, writing]
+
+# 工作区根目录（缺省 <repo>/workspace）
+# workspace_root: ../workspace

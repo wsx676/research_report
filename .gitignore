@@ -1,0 +1,43 @@
+# ===== 密钥（绝不入库）=====
+.env
+
+# 敏感样例：SAR 评测 Access Token（官方提交样例自带，不入公开仓库）
+提交样例/Agentic Reviewer/PaperReview-AccessToken.txt
+
+# ===== 第三方框架克隆（独立 git 仓库，570MB，另行管理）=====
+jiuwenswarm/
+
+# ===== 运行产出（各 workspace 项目自带独立 git）=====
+workspace/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ===== LaTeX 编译辅助 =====
+*.aux
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.toc
+*.out
+
+# ===== 日志 =====
+*.log
+!jiuwenswarm/.gitkeep
+
+# ===== IDE / 工具 =====
+.qoder/
+.vscode/
+.idea/
+tools/
+
+# ===== OS =====
+Thumbs.db
+.DS_Store

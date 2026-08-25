@@ -1,0 +1,522 @@
+From 105c6a60f4719e3109cafdf3642901640e2b5036 Mon Sep 17 00:00:00 2001
+From: wsx676 <344365843@qq.com>
+Date: Tue, 25 Aug 2026 17:30:42 +0800
+Subject: [PATCH] feat(common): add QualityGate stage-exit review gate (PR1)
+
+- configurable rubric (weighted dimensions), threshold gate, named hard checks
+
+- circuit breaker: force accept best draft after max_iterations consecutive failures
+
+- per-round JSONL review records for auditing (records_dir)
+
+- domain-agnostic: ideation_default() preset + generic usage example
+
+- 19 unit tests incl. breaker path, records, non-research rubric
+---
+ jiuwenswarm/common/quality_gate.py           | 282 +++++++++++++++++++
+ tests/unit_tests/common/test_quality_gate.py | 204 ++++++++++++++
+ 2 files changed, 486 insertions(+)
+ create mode 100644 jiuwenswarm/common/quality_gate.py
+ create mode 100644 tests/unit_tests/common/test_quality_gate.py
+
+diff --git a/jiuwenswarm/common/quality_gate.py b/jiuwenswarm/common/quality_gate.py
+new file mode 100644
+index 0000000..096499b
+--- /dev/null
++++ b/jiuwenswarm/common/quality_gate.py
+@@ -0,0 +1,282 @@
++# -*- coding: utf-8 -*-
++"""Pluggable stage-exit quality gate for swarm pipelines (QualityGate).
++
++A generic review gate that decides which candidate may leave a pipeline
++stage.  It is intentionally domain-agnostic: the rubric, pass threshold,
++hard checks and circuit-breaker policy are all configuration, so the same
++component serves research-hypothesis screening, code-review gating,
++content moderation, etc.
++
++Features
++--------
++- Configurable rubric: named dimensions with weights (weighted scoring).
++- Configurable threshold: a candidate passes when its weighted score
++  reaches ``GateConfig.threshold`` and all hard checks pass.
++- Review records on disk: every ``review()`` call appends one JSON line
++  to ``records_dir/quality_gate_reviews.jsonl`` for auditing.
++- Built-in circuit breaker: after ``max_iterations`` consecutive rounds
++  without a passing candidate, the highest-scoring candidate is force
++  accepted (marked ``forced=True``) so long-running pipelines cannot
++  deadlock in an endless refine loop.
++
++Example (non-research usage — code review gate)::
++
++    config = GateConfig(
++        dimensions=[RubricDimension("coverage", 0.5),
++                    RubricDimension("style", 0.5)],
++        threshold=0.7,
++    )
++    gate = QualityGate(config)
++    decision = gate.review([Candidate("pr-42", scores={"coverage": 0.9,
++                                                        "style": 0.8})])
++    assert decision.passed and decision.candidate_id == "pr-42"
++"""
++from __future__ import annotations
++
++import json
++import threading
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Callable, Dict, List, Optional
++
++RECORDS_FILENAME = "quality_gate_reviews.jsonl"
++
++#: Signature of a hard check: receives a candidate, returns True when OK.
++HardCheck = Callable[["Candidate"], bool]
++
++
++@dataclass
++class RubricDimension:
++    """One scoring dimension of the rubric.
++
++    Attributes:
++        name: Dimension identifier (e.g. ``"novelty"``).
++        weight: Non-negative weight; weights are normalised at review time,
++            so they do not need to sum to 1.
++        description: Human-readable description, persisted into records.
++    """
++
++    name: str
++    weight: float = 1.0
++    description: str = ""
++
++
++@dataclass
++class GateConfig:
++    """Configuration for :class:`QualityGate`.
++
++    Attributes:
++        dimensions: Rubric dimensions (at least one).
++        threshold: Weighted-score threshold in [0, 1] required to pass.
++        max_iterations: Circuit-breaker budget — after this many
++            consecutive rounds without a passing candidate, the best
++            candidate is force accepted. ``0`` disables the breaker.
++        hard_checks: Named callables that must all pass regardless of
++            score (e.g. budget compliance, policy compliance).
++        gate_name: Label used in records and log messages.
++    """
++
++    dimensions: List[RubricDimension]
++    threshold: float = 0.6
++    max_iterations: int = 3
++    hard_checks: Dict[str, HardCheck] = field(default_factory=dict)
++    gate_name: str = "quality_gate"
++
++    def __post_init__(self) -> None:
++        if not self.dimensions:
++            raise ValueError("GateConfig requires at least one dimension")
++        if any(d.weight < 0 for d in self.dimensions):
++            raise ValueError("dimension weights must be non-negative")
++        if not 0.0 <= self.threshold <= 1.0:
++            raise ValueError("threshold must be within [0, 1]")
++
++    @classmethod
++    def ideation_default(cls, threshold: float = 0.6,
++                         max_iterations: int = 3) -> "GateConfig":
++        """Rubric used by research-ideation gates (equal weights)."""
++        return cls(
++            dimensions=[
++                RubricDimension("novelty", 0.25, "differs from prior work"),
++                RubricDimension("verifiability", 0.25, "has a testable prediction"),
++                RubricDimension("compute_feasibility", 0.25, "fits the compute budget"),
++                RubricDimension("boundary_clarity", 0.25, "scope is well defined"),
++            ],
++            threshold=threshold,
++            max_iterations=max_iterations,
++            gate_name="ideation_gate",
++        )
++
++
++@dataclass
++class Candidate:
++    """One candidate submitted to the gate.
++
++    Attributes:
++        id: Unique candidate identifier.
++        scores: Dimension name -> score in [0, 1]. Missing dimensions
++            count as 0.
++        payload: Arbitrary caller metadata (echoed into records only when
++            ``record_payload=True`` is passed to :meth:`QualityGate.review`).
++    """
++
++    id: str
++    scores: Dict[str, float] = field(default_factory=dict)
++    payload: Dict[str, Any] = field(default_factory=dict)
++
++
++@dataclass
++class GateDecision:
++    """Outcome of one :meth:`QualityGate.review` round.
++
++    Attributes:
++        passed: Whether some candidate was accepted this round.
++        candidate_id: Accepted candidate id (``None`` when not passed).
++        forced: True when acceptance came from the circuit breaker.
++        reason: Human-readable explanation.
++        weighted: Weighted score per candidate id, for auditing.
++        hard_check_failures: Candidate id -> names of failed hard checks.
++        iteration: Iteration counter echoed from the caller.
++    """
++
++    passed: bool
++    candidate_id: Optional[str]
++    forced: bool
++    reason: str
++    weighted: Dict[str, float] = field(default_factory=dict)
++    hard_check_failures: Dict[str, List[str]] = field(default_factory=dict)
++    iteration: int = 1
++
++
++class QualityGate:
++    """Stage-exit review gate with on-disk audit trail and circuit breaker.
++
++    Args:
++        config: Gate configuration (rubric, threshold, breaker policy).
++        records_dir: Optional directory receiving one JSON line per
++            review round. ``None`` disables persistence.
++    """
++
++    def __init__(self, config: GateConfig,
++                 records_dir: Optional[Path | str] = None) -> None:
++        self.config = config
++        self.records_dir = Path(records_dir) if records_dir else None
++        if self.records_dir is not None:
++            self.records_dir.mkdir(parents=True, exist_ok=True)
++        self._lock = threading.Lock()
++        self._consecutive_failures = 0
++
++    # ------------------------------------------------------------ scoring
++    def weighted_score(self, candidate: Candidate) -> float:
++        """Weighted rubric score in [0, 1]; missing dimensions count as 0."""
++        total_weight = sum(d.weight for d in self.config.dimensions)
++        if total_weight <= 0:
++            return 0.0
++        acc = 0.0
++        for dim in self.config.dimensions:
++            value = float(candidate.scores.get(dim.name, 0.0))
++            acc += dim.weight * max(0.0, min(1.0, value))
++        return acc / total_weight
++
++    def _failed_hard_checks(self, candidate: Candidate) -> List[str]:
++        return [name for name, fn in self.config.hard_checks.items()
++                if not fn(candidate)]
++
++    # ------------------------------------------------------------- review
++    def review(self, candidates: List[Candidate], iteration: int = 1,
++               record_payload: bool = False) -> GateDecision:
++        """Review one batch of candidates and return the gate decision.
++
++        The ``iteration`` counter should be advanced by the caller on each
++        refine round; the circuit breaker fires after
++        ``config.max_iterations`` consecutive rounds without acceptance.
++        """
++        if not candidates:
++            decision = GateDecision(False, None, False, "no candidates submitted",
++                                    iteration=iteration)
++            self._persist(decision, candidates, record_payload)
++            return decision
++
++        weighted = {c.id: self.weighted_score(c) for c in candidates}
++        hard_failures = {c.id: self._failed_hard_checks(c) for c in candidates}
++        eligible = [c for c in candidates
++                    if not hard_failures[c.id]
++                    and weighted[c.id] >= self.config.threshold]
++
++        forced = False
++        if eligible:
++            winner = max(eligible, key=lambda c: weighted[c.id])
++            self._consecutive_failures = 0
++            reason = (f"weighted score {weighted[winner.id]:.3f} >= "
++                      f"threshold {self.config.threshold}")
++        else:
++            self._consecutive_failures += 1
++            breaker_armed = (self.config.max_iterations > 0
++                             and self._consecutive_failures >= self.config.max_iterations)
++            if breaker_armed:
++                # Circuit breaker: force accept the best draft to avoid an
++                # endless refine loop. Hard-check failures still block —
++                # pick the highest scorer among hard-check-clean candidates,
++                # falling back to the global best when none qualify.
++                clean = [c for c in candidates if not hard_failures[c.id]]
++                pool = clean or candidates
++                winner = max(pool, key=lambda c: weighted[c.id])
++                forced = True
++                reason = (f"circuit breaker after {self._consecutive_failures} "
++                          f"rounds without acceptance; force accepted best draft")
++                self._consecutive_failures = 0
++            else:
++                decision = GateDecision(
++                    False, None, False,
++                    f"no candidate reached threshold {self.config.threshold} "
++                    f"(round {self._consecutive_failures}/"
++                    f"{self.config.max_iterations or '∞'})",
++                    weighted=weighted, hard_check_failures=hard_failures,
++                    iteration=iteration)
++                self._persist(decision, candidates, record_payload)
++                return decision
++
++        decision = GateDecision(True, winner.id, forced, reason,
++                                weighted=weighted,
++                                hard_check_failures=hard_failures,
++                                iteration=iteration)
++        self._persist(decision, candidates, record_payload)
++        return decision
++
++    def reset_breaker(self) -> None:
++        """Reset the consecutive-failure counter (e.g. on new topic)."""
++        self._consecutive_failures = 0
++
++    # ------------------------------------------------------------- record
++    def _persist(self, decision: GateDecision, candidates: List[Candidate],
++                 record_payload: bool) -> None:
++        if self.records_dir is None:
++            return
++        record = {
++            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
++            "gate": self.config.gate_name,
++            "iteration": decision.iteration,
++            "threshold": self.config.threshold,
++            "rubric": {d.name: d.weight for d in self.config.dimensions},
++            "candidates": [
++                {
++                    "id": c.id,
++                    "scores": c.scores,
++                    "weighted": decision.weighted.get(c.id),
++                    "hard_check_failures": decision.hard_check_failures.get(c.id, []),
++                    **({"payload": c.payload} if record_payload else {}),
++                }
++                for c in candidates
++            ],
++            "decision": {
++                "passed": decision.passed,
++                "candidate_id": decision.candidate_id,
++                "forced": decision.forced,
++                "reason": decision.reason,
++            },
++        }
++        line = json.dumps(record, ensure_ascii=False)
++        with self._lock:
++            with open(self.records_dir / RECORDS_FILENAME, "a",
++                      encoding="utf-8") as f:
++                f.write(line + "\n")
+diff --git a/tests/unit_tests/common/test_quality_gate.py b/tests/unit_tests/common/test_quality_gate.py
+new file mode 100644
+index 0000000..aa68ac0
+--- /dev/null
++++ b/tests/unit_tests/common/test_quality_gate.py
+@@ -0,0 +1,204 @@
++# -*- coding: utf-8 -*-
++"""Unit tests for :mod:`jiuwenswarm.common.quality_gate` (PR1: QualityGate).
++
++Covers: weighted scoring, threshold gate, hard checks, the circuit-breaker
++path (forced acceptance), on-disk review records and a non-research rubric
++to prove the component is domain-agnostic.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from jiuwenswarm.common.quality_gate import (
++    RECORDS_FILENAME,
++    Candidate,
++    GateConfig,
++    QualityGate,
++    RubricDimension,
++)
++
++
++@pytest.fixture()
++def ideation_gate(tmp_path):
++    """Ideation rubric gate (4 equal dimensions) with records enabled."""
++    config = GateConfig.ideation_default(threshold=0.6, max_iterations=3)
++    return QualityGate(config, records_dir=tmp_path)
++
++
++# ------------------------------------------------------------- validation
++class TestGateConfig:
++    def test_rejects_empty_dimensions(self):
++        with pytest.raises(ValueError):
++            GateConfig(dimensions=[])
++
++    def test_rejects_negative_weight(self):
++        with pytest.raises(ValueError):
++            GateConfig(dimensions=[RubricDimension("a", -0.1)])
++
++    def test_rejects_threshold_out_of_range(self):
++        with pytest.raises(ValueError):
++            GateConfig(dimensions=[RubricDimension("a")], threshold=1.2)
++
++    def test_ideation_default_has_four_dimensions(self):
++        config = GateConfig.ideation_default()
++        names = {d.name for d in config.dimensions}
++        assert names == {"novelty", "verifiability",
++                         "compute_feasibility", "boundary_clarity"}
++
++
++# --------------------------------------------------------------- scoring
++class TestScoring:
++    def test_weighted_score_normalises_weights(self):
++        config = GateConfig(
++            dimensions=[RubricDimension("a", 3.0), RubricDimension("b", 1.0)])
++        gate = QualityGate(config)
++        candidate = Candidate("c1", scores={"a": 1.0, "b": 0.0})
++        assert gate.weighted_score(candidate) == pytest.approx(0.75)
++
++    def test_missing_dimension_counts_as_zero(self):
++        gate = QualityGate(GateConfig(dimensions=[
++            RubricDimension("a"), RubricDimension("b")]))
++        assert gate.weighted_score(Candidate("c1", {"a": 0.8})) == \
++            pytest.approx(0.4)
++
++    def test_scores_clamped_to_unit_interval(self):
++        gate = QualityGate(GateConfig(dimensions=[RubricDimension("a")]))
++        assert gate.weighted_score(Candidate("c1", {"a": 1.7})) == \
++            pytest.approx(1.0)
++
++
++# ----------------------------------------------------------------- gate
++class TestReview:
++    def test_passes_candidate_above_threshold(self, ideation_gate):
++        good = Candidate("H1", {d.name: 0.8 for d in
++                                GateConfig.ideation_default().dimensions})
++        decision = ideation_gate.review([good])
++        assert decision.passed
++        assert decision.candidate_id == "H1"
++        assert not decision.forced
++
++    def test_rejects_all_below_threshold(self, ideation_gate):
++        weak = Candidate("H1", {d.name: 0.3 for d in
++                                GateConfig.ideation_default().dimensions})
++        decision = ideation_gate.review([weak])
++        assert not decision.passed
++        assert decision.candidate_id is None
++
++    def test_picks_highest_when_several_pass(self, ideation_gate):
++        low = Candidate("H1", {d.name: 0.65 for d in
++                               GateConfig.ideation_default().dimensions})
++        high = Candidate("H2", {d.name: 0.9 for d in
++                                GateConfig.ideation_default().dimensions})
++        decision = ideation_gate.review([low, high])
++        assert decision.candidate_id == "H2"
++
++    def test_hard_check_blocks_high_score(self):
++        config = GateConfig(
++            dimensions=[RubricDimension("score")],
++            threshold=0.5,
++            hard_checks={"within_budget":
++                         lambda c: c.payload.get("tokens", 0) <= 1000},
++        )
++        gate = QualityGate(config)
++        over = Candidate("c1", {"score": 0.9}, payload={"tokens": 5000})
++        decision = gate.review([over])
++        assert not decision.passed
++        assert decision.hard_check_failures["c1"] == ["within_budget"]
++
++    def test_empty_candidate_list_is_rejected(self, ideation_gate):
++        decision = ideation_gate.review([])
++        assert not decision.passed
++        assert "no candidates" in decision.reason
++
++
++# -------------------------------------------------------- circuit breaker
++class TestCircuitBreaker:
++    def test_forced_accept_after_max_iterations(self, ideation_gate):
++        """熔断路径：连续 3 轮无假设过门 → 强制放行最高分草案。"""
++        weak = Candidate("H1", {d.name: 0.3 for d in
++                                GateConfig.ideation_default().dimensions})
++        for iteration in (1, 2):
++            decision = ideation_gate.review([weak], iteration=iteration)
++            assert not decision.passed
++        decision = ideation_gate.review([weak], iteration=3)
++        assert decision.passed
++        assert decision.forced
++        assert decision.candidate_id == "H1"
++        assert "circuit breaker" in decision.reason
++
++    def test_breaker_counter_resets_after_pass(self, ideation_gate):
++        weak = Candidate("H1", {d.name: 0.3 for d in
++                                GateConfig.ideation_default().dimensions})
++        good = Candidate("H2", {d.name: 0.9 for d in
++                                GateConfig.ideation_default().dimensions})
++        ideation_gate.review([weak], iteration=1)
++        ideation_gate.review([weak], iteration=2)
++        assert ideation_gate.review([good], iteration=3).passed
++        # two more failures must NOT trip the breaker (counter was reset)
++        assert not ideation_gate.review([weak], iteration=4).passed
++        assert not ideation_gate.review([weak], iteration=5).passed
++        assert ideation_gate.review([weak], iteration=6).forced
++
++    def test_breaker_disabled_with_zero_max_iterations(self):
++        config = GateConfig(dimensions=[RubricDimension("a")],
++                            threshold=0.9, max_iterations=0)
++        gate = QualityGate(config)
++        weak = Candidate("c1", {"a": 0.5})
++        for _ in range(5):
++            decision = gate.review([weak])
++        assert not decision.passed and not decision.forced
++
++
++# --------------------------------------------------------------- records
++class TestRecords:
++    def test_review_record_appended_as_jsonl(self, ideation_gate, tmp_path):
++        good = Candidate("H1", {d.name: 0.8 for d in
++                                GateConfig.ideation_default().dimensions})
++        ideation_gate.review([good], iteration=1)
++        ideation_gate.review([], iteration=2)
++        lines = (tmp_path / RECORDS_FILENAME).read_text(
++            encoding="utf-8").strip().splitlines()
++        assert len(lines) == 2
++        record = json.loads(lines[0])
++        assert record["gate"] == "ideation_gate"
++        assert record["decision"]["candidate_id"] == "H1"
++        assert record["candidates"][0]["weighted"] == pytest.approx(0.8)
++
++    def test_payload_only_persisted_when_opted_in(self, ideation_gate,
++                                                  tmp_path):
++        good = Candidate("H1", {d.name: 0.8 for d in
++                                GateConfig.ideation_default().dimensions},
++                         payload={"secret": "x"})
++        ideation_gate.review([good], iteration=1)
++        ideation_gate.review([good], iteration=2, record_payload=True)
++        lines = (tmp_path / RECORDS_FILENAME).read_text(
++            encoding="utf-8").strip().splitlines()
++        assert "payload" not in json.loads(lines[0])["candidates"][0]
++        assert json.loads(lines[1])["candidates"][0]["payload"]["secret"] == "x"
++
++    def test_no_records_without_records_dir(self):
++        gate = QualityGate(GateConfig(dimensions=[RubricDimension("a")]))
++        decision = gate.review([Candidate("c1", {"a": 0.9})],
++                               iteration=1)
++        assert decision.passed  # no IO error without records_dir
++
++
++# ------------------------------------------------- non-research usage
++def test_generic_code_review_gate():
++    """同一组件服务非科研场景（代码评审门），验证 PR 通用性要求。"""
++    config = GateConfig(
++        dimensions=[RubricDimension("coverage", 0.6),
++                    RubricDimension("style", 0.4)],
++        threshold=0.7,
++        gate_name="code_review_gate",
++    )
++    gate = QualityGate(config)
++    decision = gate.review([
++        Candidate("pr-42", {"coverage": 0.9, "style": 0.8}),
++        Candidate("pr-43", {"coverage": 0.5, "style": 0.9}),
++    ])
++    assert decision.passed
++    assert decision.candidate_id == "pr-42"
++    assert decision.weighted["pr-42"] == pytest.approx(0.86)
+-- 
+2.51.0.windows.1
+
