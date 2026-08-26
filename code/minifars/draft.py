@@ -23,6 +23,8 @@ from .artifacts import load_cards
 from .contract import extract_json_object
 from .llm import LLMClient
 
+from jiuwenswarm.common.academic_format import CITE_RE  # PR3 组件
+
 DRAFT_MAX_TOKENS = 8192
 #: 相关工作最多引用卡片数
 MAX_RELATED_CITATIONS = 6
@@ -78,7 +80,10 @@ class CitationChecker:
 
     def _base_key(self, card: Dict[str, Any]) -> str:
         authors = card.get("authors") or ["anonymous"]
-        surname = self._ascii(str(authors[0]).split()[-1]).lower()
+        first = str(authors[0]) or "anonymous"
+        parts = first.split()
+        # 空作者名/纯符号名（S2 路径可产出）不得崩溃，回落 anon
+        surname = self._ascii(parts[-1] if parts else "anon").lower()
         surname = re.sub(r"[^a-z]", "", surname) or "anon"
         year = str(card.get("published") or "9999")[:4]
         word = ""
@@ -133,10 +138,38 @@ def latex_escape(s: str) -> str:
 #: LLM 输出的 LaTeX 段落里，命令之外的裸特殊字符净化（未转义的
 #: method 名 proposed_xxx、裸 & 等会在 XeTeX 触发 Missing $）
 _LATEX_CMD = re.compile(r"\\[a-zA-Z]+")
+#: 未转义 $...$ 成对的行内数学 span（内容原样保留，不净化）
+_MATH_SPAN = re.compile(r"(?<!\\)\$(.*?)(?<!\\)\$", re.S)
+#: tabular 环境（& 是列分隔符，整段原样保留）
+_TABULAR_SPAN = re.compile(r"(\\begin\{tabular\}.*?\\end\{tabular\})", re.S)
 
 
 def sanitize_llm_latextext(s: str) -> str:
-    """LLM 产出按 LaTeX 对待：保护合法命令，转义裸特殊字符。"""
+    """LLM 产出按 LaTeX 对待：保护命令/行内数学/tabular，转义其余裸字符。"""
+    parts = []
+    pos = 0
+    for m in _TABULAR_SPAN.finditer(s):
+        parts.append(_sanitize_text(s[pos:m.start()]))
+        parts.append(m.group(1))     # tabular 结构原样（& 为列分隔符）
+        pos = m.end()
+    parts.append(_sanitize_text(s[pos:]))
+    return "".join(parts)
+
+
+def _sanitize_text(s: str) -> str:
+    """$...$ 数学 span 原样，其余文本走命令保护 + 裸字符转义。"""
+    parts = []
+    pos = 0
+    for m in _MATH_SPAN.finditer(s):
+        parts.append(_escape_cmds(s[pos:m.start()]))
+        parts.append(m.group(0))     # 含 $ 定界符整体原样
+        pos = m.end()
+    parts.append(_escape_cmds(s[pos:]))
+    return "".join(parts)
+
+
+def _escape_cmds(s: str) -> str:
+    r"""合法 \command 原样保留，命令间隙的裸特殊字符转义。"""
     parts = []
     pos = 0
     for m in _LATEX_CMD.finditer(s):
@@ -225,24 +258,27 @@ class DraftAgent:
         if self.llm is not None:
             try:
                 out = self._llm_sections(bp, grouped, keys)
-                if out and all(out.get(s) for s in SECTIONS):
-                    out["_cited_keys"] = self._used_cite_keys(out, keys)
+                if out and out.get("abstract") and all(out.get(s) for s in SECTIONS):
+                    out["_cited_keys"] = self._used_cite_keys(out)
                     return out
-                print("[draft] LLM 输出节缺失，回落确定性模板")
+                print("[draft] LLM 输出节/摘要缺失，回落确定性模板")
             except Exception as exc:
                 print(f"[draft] LLM 写作失败回落确定性模板: {exc}")
         out = self._template_sections(bp, grouped, keys)
-        out["_cited_keys"] = self._used_cite_keys(out, keys)
+        out["_cited_keys"] = self._used_cite_keys(out)
         return out
 
     @staticmethod
-    def _used_cite_keys(sections: Dict[str, str],
-                        allowed: List[str]) -> List[str]:
-        """正文实际用到的 key 才进 references.bib（且必在白名单内）。"""
+    def _used_cite_keys(sections: Dict[str, str]) -> List[str]:
+        """正文实际用到的 cite key（含 natbib 变体/可选参数形态）。
+
+        不过滤白名单：幻觉 key 由此进入 run() 的 CitationChecker.check，
+        在 draft.tex 落盘之前被 RuntimeError 拦截（宁停勿幻觉）。
+        """
         text = "\n".join(v for k, v in sections.items() if k != "_cited_keys")
-        used = re.findall(r"\\cite[pt]?\{([^}]+)\}", text)
-        flat = [k for grp in used for k in grp.split(",")]
-        return [k for k in dict.fromkeys(flat) if k in allowed]
+        used = CITE_RE.findall(text)
+        flat = [k.strip() for grp in used for k in grp.split(",")]
+        return list(dict.fromkeys(flat))
 
     def _llm_sections(self, bp: Dict[str, Any],
                       grouped: Dict[str, List[Dict[str, Any]]],
@@ -328,6 +364,9 @@ class DraftAgent:
                         "gated, evidence-first pipeline in which every paper "
                         "claim is linked to an audited artifact and every "
                         "number is produced by a deterministic seeded script.")
+        # 模板路径产纯文本摘要：转义责任在此完成；_assemble 不再二次转义
+        # （LLM 路径摘要已 sanitize，二次转义会把 \% 破坏成乱码——C2）
+        abstract = latex_escape(abstract)
         out = {
             "abstract": abstract,
             "introduction": sec("introduction",
@@ -360,7 +399,8 @@ class DraftAgent:
 
     def _assemble(self, bp: Dict[str, Any], sections: Dict[str, str],
                   cite_keys: List[str]) -> str:
-        abstract = latex_escape(sections.get("abstract", "")) or "n/a"
+        # abstract 转义/sanitize 责任在产出方（模板=latex_escape，LLM=sanitize）
+        abstract = sections.get("abstract", "").strip() or "n/a"
         table = self._results_table()
         figs_dir = self.paper_dir / "figures"
         fig1_ok = (figs_dir / "fig1.tex").exists()

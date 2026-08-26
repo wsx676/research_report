@@ -162,6 +162,29 @@ def test_llm_refine_rejects_new_numbers(tmp_path, fake_llm):
     assert "0.9999" not in c2["text"] and "0.6600" in c2["text"]
 
 
+def test_llm_refine_rejects_cross_claim_number(tmp_path, fake_llm):
+    """M4：C2 的数值挪进 C1 同样是证据外数值 → C1 整条回落。"""
+    project = make_project(tmp_path)
+    llm = fake_llm([_refine_payload(
+        C1="The hypothesis targets a score of 0.6600 on the benchmark.")])
+    agent = AnalysisAgent(TOPIC, llm, project, project / "paper")
+    agent.run()
+    bp = json.loads((project / "paper" / "blueprint.json").read_text(encoding="utf-8"))
+    c1 = next(c for c in bp["claims"] if c["id"] == "C1")
+    assert "0.6600" not in c1["text"]
+
+
+def test_ascii_reason_normalizes_gate_reason():
+    """M5：真实门 reason（全角括号 + ≥）归一化为 ASCII，C3 原文可进稿。"""
+    from minifars.analysis import _ascii_reason
+    raw = ("main(0.6600) - baseline(0.6000) = +0.0600 ≥ threshold 0.99"
+           "（direction=gt）")
+    out = _ascii_reason(raw)
+    assert out.isascii()
+    assert "(direction=gt)" in out and ">= threshold" in out
+    assert _ascii_reason(None) == "see artifact"
+
+
 def test_llm_refine_fallback_on_bad_json(tmp_path, fake_llm):
     project = make_project(tmp_path)
     llm = fake_llm(["这不是 JSON"])

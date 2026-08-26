@@ -1,0 +1,159 @@
+From 343cd2a6c7e7f08c6c180833fb76b1fcdef9c0d2 Mon Sep 17 00:00:00 2001
+From: wsx676 <344365843@qq.com>
+Date: Thu, 27 Aug 2026 01:20:27 +0800
+Subject: [PATCH] fix(common): signed/exponent numbers and natbib variants in
+ audits (PR3 review)
+
+- FLOAT_RE now captures sign, any fractional width and exponents; the
+  old 2-4-digit unsigned pattern let 0.9 / 0.12345 / 1.2e-3 escape the
+  number-consistency audit entirely
+- audit_numbers compares numerically, so sanctioned values quoted in any
+  equivalent form pass while invented values in any form are flagged
+- register_number also registers the magnitude of negative values: a
+  negative margin quoted as -0.0500 or 0.0500 no longer false-alarms
+  (honest-negative-result scenario crashed the pipeline end to end)
+- CITE_RE covers natbib variants and optional arguments
+  (\citep[e.g.]{..}, \citealp{..}); hallucinated citations could
+  previously bypass the audit as (?) in the PDF
+- regression tests for all four escape routes
+---
+ jiuwenswarm/common/academic_format.py         | 59 +++++++++++++++----
+ .../unit_tests/common/test_academic_format.py | 30 ++++++++++
+ 2 files changed, 76 insertions(+), 13 deletions(-)
+
+diff --git a/jiuwenswarm/common/academic_format.py b/jiuwenswarm/common/academic_format.py
+index 3584bef..3377d2d 100644
+--- a/jiuwenswarm/common/academic_format.py
++++ b/jiuwenswarm/common/academic_format.py
+@@ -35,31 +35,55 @@ Example (writing-stage gate)::
+ from __future__ import annotations
+ 
+ import re
+-from typing import Any, Iterable, List, Union
+-
+-#: Decimals with 2-4 fractional digits, not embedded in identifiers.
+-#: Lookahead only rejects further digits (longer decimals); a trailing
+-#: sentence period still lets the value match.
+-FLOAT_RE = re.compile(r"(?<![\w.])\d+\.\d{2,4}(?!\d)")
+-#: \cite / \citep / \citet key groups (comma-separated allowed).
+-CITE_RE = re.compile(r"\\cite[pt]?\{([^}]+)\}")
++from typing import Any, Iterable, List, Optional, Union
++
++#: Signed decimals of any fractional width with an optional exponent, not
++#: embedded in identifiers.  The leading sign is captured so a negative
++#: sanctioned value (e.g. a negative margin) matches its own text; the
++#: lookahead only rejects further digits, so a trailing sentence period
++#: still lets the value match.
++FLOAT_RE = re.compile(r"(?<![\w.])[-+]?\d+\.\d+(?:[eE][-+]?\d+)?(?!\d)")
++#: natbib cite commands in any variant (\cite, \citep, \citet, \citealp, ...),
++#: with optional star and up to two optional [..] arguments.
++CITE_RE = re.compile(r"\\cite[a-zA-Z]*\*?(?:\[[^\]]*\]){0,2}\{([^}]+)\}")
+ ABSTRACT_RE = re.compile(r"\\begin\{abstract\}(.*?)\\end\{abstract\}", re.S)
+ 
+ DEFAULT_ABSTRACT_WORD_LIMIT = 250
+ 
+ 
++def _as_float(token: str) -> Optional[float]:
++    """Parse a numeric token; None for non-numeric registry junk."""
++    try:
++        return float(token)
++    except ValueError:
++        return None
++
++
+ def audit_numbers(text: str, registry: Iterable[str]) -> List[str]:
+     """Flag decimals in ``text`` absent from the sanctioned ``registry``.
+ 
+-    An empty registry disables the audit (e.g. dry runs without
+-    experiment results).  Returns one message per offending value.
++    Comparison is numeric rather than textual, so a sanctioned value may
++    be quoted in any equivalent form (``0.66`` / ``0.6600`` / ``6.6e-1``,
++    signed or unsigned) without a false alarm, while invented values in
++    any form are still caught.  An empty registry disables the audit
++    (e.g. dry runs without experiment results).  Returns one message per
++    offending value.
+     """
+     registry = set(registry)
+     if not registry:
+         return []
+-    offenders = sorted(set(FLOAT_RE.findall(text)) - registry)
++    sanctioned = set()
++    for v in registry:
++        f = _as_float(v)
++        if f is not None:
++            sanctioned.add(f)
++    offenders = set()
++    for token in FLOAT_RE.findall(text):
++        f = _as_float(token)
++        if f is not None and f not in sanctioned:
++            offenders.add(token)
+     return [f"unregistered number {v} (not in sanctioned value set)"
+-            for v in offenders]
++            for v in sorted(offenders)]
+ 
+ 
+ def audit_citations(text: str, bib_text: str) -> List[str]:
+@@ -103,12 +127,21 @@ class AcademicFormatValidator:
+         self.registry: set = set()
+ 
+     def register_number(self, value: Union[int, float]) -> None:
+-        """Add a sanctioned numeric value (bools rejected)."""
++        """Add a sanctioned numeric value (bools rejected).
++
++        Negative values also register their magnitude so a manuscript
++        quoting an unsigned magnitude (``0.0500`` for a sanctioned
++        ``-0.05`` margin) stays sanctioned.
++        """
+         if isinstance(value, bool) or not isinstance(value, (int, float)):
+             return
+         fv = float(value)
+         self.registry.add(f"{fv:.4f}")
+         self.registry.add(f"{fv:g}")
++        if fv < 0:
++            av = -fv
++            self.registry.add(f"{av:.4f}")
++            self.registry.add(f"{av:g}")
+ 
+     def register_numbers(self, values: Iterable[Any]) -> int:
+         """Bulk registration; returns how many values were accepted."""
+diff --git a/tests/unit_tests/common/test_academic_format.py b/tests/unit_tests/common/test_academic_format.py
+index a2b50d5..b6917a2 100644
+--- a/tests/unit_tests/common/test_academic_format.py
++++ b/tests/unit_tests/common/test_academic_format.py
+@@ -50,3 +50,33 @@ def test_validator_bulk_and_validate():
+     assert any("0.7777" in p for p in bad)
+     bad2 = v.validate(tex, "")
+     assert any("k1" in p for p in bad2)
++
++
++def test_negative_margin_signed_and_unsigned():
++    """Negative margins (honest-negative-result scenario) must not false-alarm.
++
++    The signed token ``-0.0500`` and an unsigned magnitude ``0.0500`` both
++    match the sanctioned -0.05; a different value is still flagged.
++    """
++    v = AcademicFormatValidator()
++    v.register_number(0.55 - 0.60)
++    tex = ("\\begin{abstract}margin -0.0500; magnitude 0.0500.\\end{abstract}")
++    assert audit_numbers(tex, v.registry) == []
++    assert audit_numbers("margin -0.0600", v.registry) == \
++        ["unregistered number -0.0600 (not in sanctioned value set)"]
++
++
++def test_audit_numbers_catches_short_long_and_scientific():
++    """1-decimal, 5-decimal and exponent forms must not escape the audit."""
++    assert audit_numbers("a 0.9 b", {"0.66"}) != []
++    assert audit_numbers("a 0.12345 b", {"0.66"}) != []
++    assert audit_numbers("a 1.2e-3 b", {"0.66"}) != []
++    # numeric comparison: equivalent spellings of a sanctioned value pass
++    assert audit_numbers("0.9 equals 0.90", {"0.9", "0.90"}) == []
++
++
++def test_audit_citations_natbib_variants():
++    """Optional-argument cites and natbib variants must be audited."""
++    assert audit_citations("\\citep[e.g.][p.~3]{a}", "@misc{a,\n") == []
++    assert audit_citations("\\citealp{ghost}", "@misc{a,\n") == \
++        ["citation ghost missing from references database"]
+-- 
+2.51.0.windows.1
+

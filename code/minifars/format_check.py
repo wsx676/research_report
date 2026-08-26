@@ -104,10 +104,17 @@ def compile_tex(paper_dir: Path | str, tex_name: str = "draft.tex",
     default_pdf = paper_dir / (Path(tex_name).stem + ".pdf")
     target = paper_dir / out_name
     for attempt in range(2):
-        proc = subprocess.run(
-            [exe, tex_name, "--outdir", "."],
-            cwd=str(paper_dir), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=600)
+        try:
+            proc = subprocess.run(
+                [exe, tex_name, "--outdir", "."],
+                cwd=str(paper_dir), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=600)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            # 超时/可执行失效也是编译失败的一种：记入报告后重试，
+            # 而非裸 traceback 穿透（违背先写报告再抛错的契约）
+            last_err = f"tectonic invocation failed: {exc}"
+            time.sleep(1.0)
+            continue
         if proc.returncode == 0 and default_pdf.exists():
             default_pdf.replace(target)  # tectonic 按输入名产出，统一改名
             return {"ok": True, "pdf": str(target), "attempts": attempt + 1}

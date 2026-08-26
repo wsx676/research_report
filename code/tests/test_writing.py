@@ -95,6 +95,106 @@ def test_draft_llm_partial_fallback(tmp_path, fake_llm):
     assert "\\section{Conclusion}" in tex and "only" not in tex
 
 
+def test_draft_llm_missing_abstract_fallback(tmp_path, fake_llm):
+    """M6：7 节齐全但缺 abstract → 同样整篇回落（不产 "n/a" 摘要稿）。"""
+    project = make_project(tmp_path)
+    bp_path = AnalysisAgent(TOPIC, None, project,
+                            project / "paper").run()["blueprint"]
+    payload = json.dumps({"sections": {s: f"Body {s}." for s in SECTIONS}})
+    DraftAgent(TOPIC, fake_llm([payload]), project,
+               project / "paper").run(bp_path)
+    tex = (project / "paper" / "draft.tex").read_text(encoding="utf-8")
+    assert "Body introduction." not in tex  # 回落确定性模板
+    assert tex.count("\\begin{abstract}") == 1
+
+
+def test_draft_llm_abstract_latex_preserved(tmp_path, fake_llm):
+    """C2：LLM 摘要已 sanitize，_assemble 不得二次 latex_escape（乱码）。"""
+    project = make_project(tmp_path)
+    bp_path = AnalysisAgent(TOPIC, None, project,
+                            project / "paper").run()["blueprint"]
+    key = next(iter(CitationChecker(CARDS["cards"]).key_of))
+    sections = {s: f"Body {s}." for s in SECTIONS}
+    sections["related_work"] = f"Cites~\\cite{{{key}}}."
+    abstract = (r"We improve accuracy by 5\% with \emph{evidence-first} "
+                r"top-$k$ retrieval.")
+    payload = json.dumps({"abstract": abstract, "sections": sections})
+    DraftAgent(TOPIC, fake_llm([payload]), project,
+               project / "paper").run(bp_path)
+    tex = (project / "paper" / "draft.tex").read_text(encoding="utf-8")
+    assert r"5\%" in tex and r"\emph{evidence-first}" in tex
+    assert "textbackslash" not in tex   # 双重转义残留 = C2 复发
+    assert "top-$k$" in tex             # M3：行内数学原样
+
+
+def test_draft_llm_cite_variants(tmp_path, fake_llm):
+    """M2：natbib 可选参数/变体 cite 的 key 必须进 bib 并过引用审计。"""
+    project = make_project(tmp_path)
+    bp_path = AnalysisAgent(TOPIC, None, project,
+                            project / "paper").run()["blueprint"]
+    key = next(iter(CitationChecker(CARDS["cards"]).key_of))
+    sections = {s: f"Body {s}." for s in SECTIONS}
+    sections["related_work"] = (f"Prior work~\\citep[e.g.]{{{key}}} "
+                                f"and \\citealp{{{key}}}.")
+    payload = json.dumps({"abstract": "An abstract.", "sections": sections})
+    DraftAgent(TOPIC, fake_llm([payload]), project,
+               project / "paper").run(bp_path)
+    tex = (project / "paper" / "draft.tex").read_text(encoding="utf-8")
+    bib = (project / "paper" / "references.bib").read_text(encoding="utf-8")
+    assert f"@article{{{key}," in bib or f"@misc{{{key}," in bib
+    assert audit_citations(tex, bib) == []
+
+
+def test_draft_rejects_hallucinated_citation_before_write(tmp_path, fake_llm):
+    """m3：幻觉引用在 draft.tex 落盘前被 CitationChecker 拦截（宁停）。"""
+    project = make_project(tmp_path)
+    bp_path = AnalysisAgent(TOPIC, None, project,
+                            project / "paper").run()["blueprint"]
+    sections = {s: f"Body {s}." for s in SECTIONS}
+    sections["related_work"] = r"Ghost work~\cite{ghost2025fake}."
+    payload = json.dumps({"abstract": "An abstract.", "sections": sections})
+    with pytest.raises(RuntimeError, match="CitationChecker"):
+        DraftAgent(TOPIC, fake_llm([payload]), project,
+                   project / "paper").run(bp_path)
+    assert not (project / "paper" / "draft.tex").exists()
+
+
+def test_negative_margin_end_to_end(tmp_path):
+    """C1+M5 端到端：主实验低于基线（负结果一等公民场景）不再假阳性崩溃；
+    门判定 reason（全角括号/≥）归一化后 C3 原文进稿而非制品指针句。"""
+    project = make_project(tmp_path)
+    results = project / "exp" / "results"
+    m1 = json.loads((results / "M1.json").read_text(encoding="utf-8"))
+    m1["metrics"]["score"] = 0.55
+    m1["metrics"]["per_seed"] = {"0": {"score": 0.55}}
+    (results / "M1.json").write_text(json.dumps(m1), encoding="utf-8")
+    (results / "gate_verdict.json").write_text(json.dumps(
+        {"passed": False,
+         "reason": "main(0.5500) - baseline(0.6000) = -0.0500 < threshold "
+                   "0.99（direction=gt）",
+         "main_value": 0.55, "baseline_value": 0.60,
+         "direction": "gt", "threshold": 0.99}), encoding="utf-8")
+    bp_path = AnalysisAgent(TOPIC, None, project,
+                            project / "paper").run()["blueprint"]
+    DraftAgent(TOPIC, None, project, project / "paper").run(bp_path)
+    tex = (project / "paper" / "draft.tex").read_text(encoding="utf-8")
+    assert "-0.0500" in tex                 # 负 margin 原样入稿
+    assert "direction=gt" in tex            # M5：reason 归一化为 ASCII
+    # C3 不再退化为指针句（C1 中文假设的指针句是设计行为，不在检查范围）
+    assert "claim C3 is recorded verbatim" not in tex
+    assert "main(0.5500)" in tex            # 门判定原文进稿
+    tex.encode("ascii")
+    report = FormatAgent(project, project / "paper").run(compile_pdf=False)
+    assert report["audit_problems"] == []   # C1：审计不再假阳性
+
+
+def test_citation_checker_empty_author_name():
+    """m1：空作者名卡片（S2 路径可产出）不崩溃，key 回落 anonymous。"""
+    cards = [{"title": "Empty Author Paper", "authors": [""],
+              "published": "2026-01-01", "paper_id": "arxiv:2608.33333v1"}]
+    assert list(CitationChecker(cards).key_of) == ["anonymous2026empty"]
+
+
 # ------------------------------------------------------------------ format
 def test_audits_detect_violations():
     registry = {"0.6600", "0.6000"}
@@ -150,3 +250,11 @@ def test_sanitize_llm_latextext():
     assert sanitize_llm_latextext(r"\cite{k} a\_b \%") == r"\cite{k} a\_b \%"
     # 命令参数花括号保留
     assert sanitize_llm_latextext(r"\texttt{exp/code}") == r"\texttt{exp/code}"
+    # M3：行内数学 $...$ 整体原样（含内部 _ 与 \le）
+    math = "top-$k$ where $x_1 \\le k$"
+    assert sanitize_llm_latextext(math) == math
+    # M3：tabular 环境原样（& 是列分隔符不是裸字符）
+    tab = "\\begin{tabular}{ll} a & b \\\\ \\end{tabular}"
+    assert sanitize_llm_latextext(tab) == tab
+    # M3：数学外的裸下划线仍转义，数学内不转义
+    assert sanitize_llm_latextext("a_b $x_1$ c_d") == r"a\_b $x_1$ c\_d"

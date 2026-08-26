@@ -12,9 +12,11 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -180,7 +182,7 @@ def build_claims(ev: Dict[str, Any]) -> List[Dict[str, Any]]:
         claims.append({
             "id": "C3", "section": "analysis",
             "text": (f"The pre-registered effectiveness gate {verdict} its "
-                     f"threshold: {gate.get('reason', 'see artifact')}."),
+                     f"threshold: {_ascii_reason(gate.get('reason'))}."),
             "evidence": [
                 {"source_artifact": rel["gate"], "figure_candidate": None,
                  "support_strength": "strong"},
@@ -400,12 +402,15 @@ class AnalysisAgent:
         """LLM 仅润色 claim 文本；evidence 保持制品推导结果不变。
 
         校验：输出条数/id 必须与输入一一对应，text 非空且不得引入新数值
-        （数值白名单 = 证据事实中出现过的浮点数）；任何违规整批回落确定性文本。
+        （数值白名单**按 claim 隔离** = 该 claim 证据事实中出现过的浮点数；
+        跨 claim 挪用他人数值同样视为证据外数值）；任何违规整条回落
+        确定性文本。
         """
         facts = {c["id"]: c["text"] for c in claims}
-        allowed_numbers = set()
-        for txt in facts.values():
-            allowed_numbers.update(_extract_numbers(txt))
+        # M4：白名单按 claim 隔离——C1 的白名单不含 C2 的分数，
+        # LLM 把 C2 的数值挪进 C1 属于证据外数值，整条回落
+        allowed_by_id = {cid: _extract_numbers(txt)
+                         for cid, txt in facts.items()}
         prompt = (
             "Below are evidence-grounded claim statements of a paper blueprint.\n"
             f"{json.dumps(facts, ensure_ascii=False, indent=1)}\n\n"
@@ -427,9 +432,9 @@ class AnalysisAgent:
         out = []
         for c in claims:
             text = refined.get(c["id"]) or c["text"]
-            new_numbers = _extract_numbers(text) - allowed_numbers
+            new_numbers = _extract_numbers(text) - allowed_by_id[c["id"]]
             if not text or new_numbers:
-                # 引入未见于证据的数值 = 结果幻觉信号，整条回落
+                # 引入未见于本 claim 证据的数值 = 结果幻觉信号，整条回落
                 text = c["text"]
             out.append({**c, "text": text})
         return out
@@ -444,5 +449,28 @@ class AnalysisAgent:
 
 
 def _extract_numbers(text: str) -> set:
-    import re
-    return set(re.findall(r"\d+\.\d+", text))
+    """文本中数值的数值化集合（符号/指数形态归一，跨形态一致比对）。"""
+    out = set()
+    for tok in re.findall(r"[-+]?\d+\.\d+(?:[eE][-+]?\d+)?", text):
+        try:
+            out.add(float(tok))
+        except ValueError:
+            pass
+    return out
+
+
+_SYMBOL_MAP = (("≥", ">="), ("≤", "<="), ("≠", "!="), ("→", "->"),
+               ("×", "x"), ("—", "-"), ("–", "-"))
+
+
+def _ascii_reason(reason: Any) -> str:
+    """门判定 reason 尽力转 ASCII（全角括号 NFKC、数学符号映射）。
+
+    experiment.py 的 reason 恒含全角括号与 ≥/≤——不归一化则 C3 恒被判
+    非 ASCII，模板路径的门判定声明恒退化为制品指向句（M5）。归一化后仍
+    非 ASCII（如中文缺失说明）则保持原样，由 _claim_tex 的防线兜底。
+    """
+    s = unicodedata.normalize("NFKC", str(reason if reason else "see artifact"))
+    for a, b in _SYMBOL_MAP:
+        s = s.replace(a, b)
+    return s
