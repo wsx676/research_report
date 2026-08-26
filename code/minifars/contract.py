@@ -18,7 +18,7 @@ from typing import Any, Dict, List
 import yaml
 
 from .artifacts import SCHEMA_VERSION
-from .skills import METRIC_ALIASES, resolve_metric
+from .skills import METRIC_ALIASES, SYNTHETIC_SCORES, resolve_metric
 
 #: 执行层可产出的指标键（合成基准 v1：score 及别名映射目标）
 KNOWN_RESULT_KEYS = set(METRIC_ALIASES.values()) | {"score"}
@@ -74,6 +74,19 @@ def validate_contract(contract: Dict[str, Any]) -> List[str]:
             if metric and resolve_metric(metric) not in KNOWN_RESULT_KEYS:
                 problems.append(f"tasks.{cat}[{idx}] 指标 {metric!r} 不在执行层"
                                 f"已知指标表 {sorted(KNOWN_RESULT_KEYS)}")
+            method = str(t.get("method") or "")
+            if method and method not in SYNTHETIC_SCORES:
+                # 评审 M2：LLM 幻觉方法名不得静默落到 0.5±0.05 兜底分
+                problems.append(f"tasks.{cat}[{idx}] method {method!r} 不在技能库"
+                                f"方法表 {sorted(SYNTHETIC_SCORES)}")
+            seeds = t.get("seeds")
+            if seeds is not None and (
+                    not isinstance(seeds, list)
+                    or not all(isinstance(s, int) and not isinstance(s, bool)
+                               for s in seeds)):
+                # 评审 m4：类型非法在冻结点拒绝，不在执行中途炸
+                problems.append(f"tasks.{cat}[{idx}] seeds 必须为整数列表，"
+                                f"实际 {seeds!r}")
             tid = str(t.get("id") or "")
             if tid:
                 if tid in seen:
@@ -100,6 +113,11 @@ def validate_contract(contract: Dict[str, Any]) -> List[str]:
         if gate.get("direction") not in ("gt", "lt", None):
             problems.append(f"effectiveness_gate.direction 非法: "
                             f"{gate.get('direction')!r}（仅 gt/lt）")
+        thr = gate.get("threshold")
+        if not isinstance(thr, (int, float)) or isinstance(thr, bool):
+            # 评审 m4：threshold 非数值在校验期拒绝，勿在 float() 处崩
+            problems.append(f"effectiveness_gate.threshold 必须为数值，"
+                            f"实际 {thr!r}")
         ref = str(gate.get("metric") or "")
         if "." in ref:
             key = ref.split(".", 1)[1]
@@ -197,6 +215,6 @@ def contract_skeleton() -> Dict[str, Any]:
                           "method": "ablation_no_compression", "metric": "score",
                           "seeds": [0]}],
         },
-        "budget": {"llm_tokens_total": 1500000, "per_task_timeout_s": 30,
-                   "seeds_per_task": 2},
+        "budget": {"llm_tokens_total": 1500000, "experiment_wall_clock_min": 120,
+                   "per_task_timeout_s": 30, "seeds_per_task": 2},
     }

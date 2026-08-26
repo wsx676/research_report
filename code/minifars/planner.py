@@ -48,7 +48,7 @@ CONTRACT_SPEC = """\
     "effectiveness_gate": {"metric": "M1.score", "direction": "gt", "threshold": 0.0, "compare_to": "max_baseline.score", "on_fail": "early_stop_keep_negative"},
     "analysis": [{"id": "A1", "name": "消融/敏感性", "method": "...", "metric": "score", "seeds": [0]}, ...至少 1 个]
   },
-  "budget": {"llm_tokens_total": <int>, "per_task_timeout_s": <int>, "seeds_per_task": <int>}
+  "budget": {"llm_tokens_total": <int>, "experiment_wall_clock_min": <int>, "per_task_timeout_s": <int>, "seeds_per_task": <int>}
 }
 """
 
@@ -94,6 +94,9 @@ class PlannerAgent:
             raise ContractError(f"PlannerAgent 两次产出均未通过校验: {problems}")
         contract["schema"] = SCHEMA_VERSION
         contract["derived_from"] = derived_from
+        # 评审 M3：预算是 topic.yaml 硬约束，校验通过后以 topic 值覆写——
+        # LLM 幻觉放大预算（如 per_task_timeout_s: 3600）不进入执行层。
+        contract["budget"] = self._budget()
         return contract
 
     def _call(self, prompt: str) -> Dict[str, Any]:

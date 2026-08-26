@@ -2,9 +2,11 @@
 """test_experiment.py：Experiment Swarm 执行引擎（§5.3）。
 
 覆盖验收标准：run_meta 五要素、有效性门两条路径（通过/早停负结果）、
-断点续跑、预算降级（错误路径）。
+断点续跑、预算降级（错误路径）；评审回归：C1 时间戳、C2 续跑门恢复、
+M1 基线缺失、m1 direction 缺省、m3 墙钟持久化。
 """
 import json
+import time
 
 import pytest
 
@@ -186,6 +188,88 @@ def test_evaluate_effectiveness_absolute_threshold(tmp_path):
     assert evaluate_effectiveness(contract, results)["passed"] is True
     contract["tasks"]["effectiveness_gate"]["threshold"] = 0.75
     assert evaluate_effectiveness(contract, results)["passed"] is False
+
+
+def test_run_meta_timestamps_sane(tmp_path):
+    """评审 C1：started_at 必须是真实日历时间（曾误把 perf_counter 当 epoch）。"""
+    contract_path = make_contract(tmp_path)
+    orch = ExperimentOrchestrator(tmp_path, contract_path, commit_fn=lambda m: "sha")
+    orch.run()
+    results = tmp_path / "exp" / "results"
+    for f in sorted(results.glob("*.run_meta.json")):
+        meta = json.loads(f.read_text(encoding="utf-8"))
+        started, finished = meta["started_at"], meta["finished_at"]
+        assert started[:4] >= "2020" and finished[:4] >= "2020"  # 无纪元漂移
+        assert started <= finished  # 同格式字典序 = 时间序
+
+
+def test_resume_restores_gate_verdict(tmp_path):
+    """评审 C2：断点续跑恢复有效性门判定——早停语义不被重启绕过。"""
+    contract_path = make_contract(tmp_path, threshold=0.5)  # 门必失败
+    orch = ExperimentOrchestrator(tmp_path, contract_path, commit_fn=lambda m: "sha")
+    s1 = orch.run()
+    assert s1["skipped"] == {"A1": "early_stop_keep_negative"}
+
+    # 重启续跑：A1 被早停跳过从未 checkpoint，天然处于 pending——
+    # 无门判定恢复时它会被错误执行（这正是 C2 缺陷的触发路径）
+    orch2 = ExperimentOrchestrator(tmp_path, contract_path, commit_fn=lambda m: "sha")
+    s2 = orch2.run()
+    # 门判定从落盘结果重算：A1 仍被早停，不执行、不产生矛盾审计
+    assert s2["skipped"] == {"A1": "early_stop_keep_negative"}
+    assert s2["gate"]["passed"] is False
+    assert not (tmp_path / "exp" / "results" / "A1.json").exists()
+
+
+def test_gate_baseline_missing_fails(tmp_path):
+    """评审 M1：契约指定对照但基线指标全缺 → 比较不可判定，保守失败。"""
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / "M1.json").write_text(json.dumps({"metrics": {"score": 0.9}}),
+                                      encoding="utf-8")
+    contract = {"tasks": {"baselines": [{"id": "B1"}, {"id": "B2"}],
+                          "effectiveness_gate": {
+                              "metric": "M1.score", "direction": "gt",
+                              "threshold": 0.0,
+                              "compare_to": "max_baseline.score"}}}
+    verdict = evaluate_effectiveness(contract, results)
+    assert verdict["passed"] is False  # 不静默退化为绝对阈值放行
+    assert "对照基线指标缺失" in verdict["reason"]
+
+
+def test_direction_null_defaults_gt(tmp_path):
+    """评审 m1：direction 显式 null 缺省 gt 语义，不落入 lt。"""
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / "M1.json").write_text(json.dumps({"metrics": {"score": 0.7}}),
+                                      encoding="utf-8")
+    (results / "B1.json").write_text(json.dumps({"metrics": {"score": 0.6}}),
+                                      encoding="utf-8")
+    contract = {"tasks": {"baselines": [{"id": "B1"}],
+                          "effectiveness_gate": {
+                              "metric": "M1.score", "direction": None,
+                              "threshold": 0.0,
+                              "compare_to": "max_baseline.score"}}}
+    verdict = evaluate_effectiveness(contract, results)
+    assert verdict["passed"] is True  # 0.7 > 0.6 按 gt 语义通过
+    assert verdict["direction"] == "gt"
+
+
+def test_wall_clock_persists_across_restart(tmp_path):
+    """评审 m3：墙钟基准跨进程持久——重启不重置总预算。"""
+    contract_path = make_contract(tmp_path)  # threshold=0 门通过
+    orch = ExperimentOrchestrator(tmp_path, contract_path, commit_fn=lambda m: "sha")
+    orch.run()
+    # 模拟：首跑在 200 分钟前开始（超 120min 预算），A1 检查点丢失需重跑
+    marker = tmp_path / "exp" / "results" / ".run_started_at"
+    marker.write_text(str(time.time() - 200 * 60), encoding="utf-8")
+    state_path = tmp_path / "exp" / "checkpoints" / "checkpoint_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    del state["A1"]
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    orch2 = ExperimentOrchestrator(tmp_path, contract_path, commit_fn=lambda m: "sha")
+    s2 = orch2.run()
+    assert s2["skipped"] == {"A1": "skipped_budget"}  # 总墙钟已超，A1 跳过
 
 
 # ------------------------------------------------------------------ skills

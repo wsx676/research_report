@@ -89,6 +89,21 @@ def test_unparseable_output_raises(tmp_path, fake_llm):
         planner.run(_write_accepted(tmp_path))
 
 
+def test_budget_overwritten_by_topic(tmp_path, fake_llm):
+    """评审 M3：LLM 幻觉放大的预算被 topic.yaml 硬约束覆写，不进执行层。"""
+    inflated = json.loads(json.dumps(VALID_CONTRACT))
+    inflated["budget"] = {"llm_tokens_total": 99999999, "per_task_timeout_s": 3600,
+                          "seeds_per_task": 99}
+    llm = fake_llm([json.dumps(inflated, ensure_ascii=False)])
+    planner = PlannerAgent(TOPIC, llm, tmp_path / "plan")
+    out = planner.run(_write_accepted(tmp_path))
+    contract = load_contract(out["contract"])
+    assert contract["budget"]["llm_tokens_total"] == 1500000
+    assert contract["budget"]["per_task_timeout_s"] == 60  # topic 缺省，非 3600
+    assert contract["budget"]["seeds_per_task"] == 2
+    assert contract["budget"]["experiment_wall_clock_min"] == 120
+
+
 def test_budget_defaults_injected(tmp_path, fake_llm):
     topic = {"name": "t", "budget": {}}  # 全缺省
     llm = fake_llm([json.dumps(VALID_CONTRACT, ensure_ascii=False)])

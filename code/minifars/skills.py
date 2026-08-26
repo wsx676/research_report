@@ -133,11 +133,6 @@ def known_methods() -> List[str]:
     return sorted(SYNTHETIC_SCORES)
 
 
-def validate_method(method: str) -> bool:
-    """方法名是否在技能库已知方法表中（未知 → 合成兜底 0.5±0.05）。"""
-    return method in SYNTHETIC_SCORES
-
-
 def parse_seeds(raw: Any) -> List[int]:
     """容错解析 seeds 字段（契约 YAML 可能给 str/None）。"""
     if isinstance(raw, (list, tuple)):
@@ -153,5 +148,6 @@ def describe_templates() -> str:
 
 
 __all__ = ["SKILL_TEMPLATES", "SYNTHETIC_SCORES", "RESULT_MARKER",
-           "render_task_script", "parse_result_output", "known_methods",
-           "validate_method", "parse_seeds", "describe_templates"]
+           "METRIC_ALIASES", "resolve_metric", "render_task_script",
+           "parse_result_output", "known_methods", "parse_seeds",
+           "describe_templates"]

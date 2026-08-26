@@ -58,7 +58,7 @@ def evaluate_effectiveness(contract: Dict[str, Any],
     """
     gate = (contract.get("tasks") or {}).get("effectiveness_gate") or {}
     metric_ref = str(gate.get("metric") or "")
-    direction = gate.get("direction", "gt")
+    direction = gate.get("direction") or "gt"  # 显式 null 缺省 gt（m1）
     threshold = float(gate.get("threshold", 0.0))
 
     def _value(ref: str) -> Optional[float]:
@@ -88,15 +88,35 @@ def evaluate_effectiveness(contract: Dict[str, Any],
     elif compare_to:
         baseline_val = _value(compare_to)
 
+    if compare_to and baseline_val is None:
+        # 评审 M1：契约指定对照但基线指标全缺（超时/报错）→ 比较不可判定，
+        # 保守判失败（宁停勿带病放行），不静默退化为绝对阈值比较。
+        return {"passed": False,
+                "reason": f"对照基线指标缺失: {compare_to}，比较不可判定",
+                "main_value": main_val, "baseline_value": None}
+
+    def _ops(passed: bool) -> str:
+        # reason 的比较符必须与实际判定方向一致（m1：lt 路径勿打 "≥"）
+        if direction == "gt":
+            return "≥" if passed else "<"
+        return "≤" if passed else ">"
+
     if baseline_val is not None:
         margin = main_val - baseline_val
-        passed = margin >= threshold if direction == "gt" else margin <= -threshold
+        if direction == "gt":
+            passed = margin >= threshold
+        else:
+            passed = margin <= -threshold
         reason = (f"main({main_val:.4f}) - baseline({baseline_val:.4f}) = "
-                  f"{margin:+.4f} {'≥' if passed else '<'} threshold {threshold}")
+                  f"{margin:+.4f} {_ops(passed)} threshold {threshold}"
+                  f"（direction={direction}）")
     else:
-        passed = main_val >= threshold if direction == "gt" else main_val <= threshold
-        reason = (f"main({main_val:.4f}) {'≥' if passed else '<'} "
-                  f"threshold {threshold}")
+        if direction == "gt":
+            passed = main_val >= threshold
+        else:
+            passed = main_val <= threshold
+        reason = (f"main({main_val:.4f}) {_ops(passed)} threshold {threshold}"
+                  f"（direction={direction}）")
     return {"passed": bool(passed), "reason": reason,
             "main_value": main_val, "baseline_value": baseline_val,
             "direction": direction, "threshold": threshold}
@@ -141,8 +161,15 @@ class ExperimentOrchestrator:
         pending_ids = set(ckpt.pending([t["id"] for t in tasks]))
         completed: List[str] = [t["id"] for t in tasks if t["id"] not in pending_ids]
         skipped: Dict[str, str] = {}
-        t_start = time.perf_counter()
+        t_start = self._run_started_at()  # 墙钟基准跨进程持久（评审 m3）
         gate_verdict: Dict[str, Any] = {}
+
+        # 评审 C2：main 已在既往进程完成 → 从落盘结果重算门判定，
+        # 断点续跑不绕过有效性门（自愈式重评估，连"M1 已 checkpoint
+        # 但未及求值即被杀"的崩溃窗口也一并覆盖）。
+        main_ids = {t["id"] for t in tasks if t["task_type"] == "main"}
+        if main_ids and not (main_ids & pending_ids):
+            gate_verdict = evaluate_effectiveness(contract, self.results_dir)
 
         for task in tasks:
             tid = task["id"]
@@ -153,7 +180,7 @@ class ExperimentOrchestrator:
                 skipped[tid] = "early_stop_keep_negative"
                 print(f"[experiment] {tid} 跳过：有效性门未通过（负结果保留）")
                 continue
-            elapsed_min = (time.perf_counter() - t_start) / 60.0
+            elapsed_min = (time.time() - t_start) / 60.0
             if task["task_type"] == "analysis" and elapsed_min > wall_limit_min:
                 skipped[tid] = "skipped_budget"
                 print(f"[experiment] {tid} 跳过：墙钟预算耗尽（{elapsed_min:.1f}min）")
@@ -181,10 +208,23 @@ class ExperimentOrchestrator:
         (self.results_dir / "run_summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[experiment] 完成 {len(completed)} 任务，跳过 {len(skipped)}，"
-              f"耗时 {(time.perf_counter() - t_start):.1f}s")
+              f"总墙钟 {(time.time() - t_start) / 60.0:.1f}min")
         return summary
 
     # ----------------------------------------------------------- internals
+    def _run_started_at(self) -> float:
+        """墙钟预算基准（评审 m3）：首跑写入 epoch 标记，续跑读回复用——
+        杀进程重启不重置总墙钟，反复重启无法绕过 skipped_budget。"""
+        marker = self.results_dir / ".run_started_at"
+        if marker.exists():
+            try:
+                return float(marker.read_text(encoding="utf-8").strip())
+            except ValueError:
+                pass  # 标记损坏按首跑处理（基准只会后移，安全侧）
+        now = time.time()
+        marker.write_text(str(now), encoding="utf-8")
+        return now
+
     def _run_task(self, task: Dict[str, Any],
                   timeout_s: int) -> tuple:
         """渲染脚本 → 沙箱执行 → 指标落盘；超时降级 seeds 重试一次。"""
@@ -193,6 +233,7 @@ class ExperimentOrchestrator:
         script_path = self.code_dir / f"{tid}.py"
         command = f"{self.python} exp/code/{tid}.py"
         t0 = time.perf_counter()
+        t0_wall = time.time()  # 日历时间与单调钟分开记（评审 C1）
 
         status, metrics, stdout, stderr = self._execute(task, seeds, script_path,
                                                         timeout_s)
@@ -208,7 +249,7 @@ class ExperimentOrchestrator:
         meta = run_meta(task_id=tid, task_type=task["task_type"], command=command,
                         seed=seeds[0], model=SYNTHETIC_MODEL,
                         started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z",
-                                                 time.localtime(t0)),
+                                                 time.localtime(t0_wall)),
                         finished_at=finished, status=status,
                         tokens={"in": 0, "out": 0},
                         extra={"wall_s": round(time.perf_counter() - t0, 2),

@@ -69,6 +69,26 @@ def test_semantic_metric_alias_accepted():
     assert not any("recall_security" in p for p in validate_contract(c))
 
 
+def test_unknown_method_rejected():
+    c = contract_skeleton()
+    c["tasks"]["main"][0]["method"] = "hallucinated_method"
+    assert any("hallucinated_method" in p for p in validate_contract(c))
+
+
+def test_threshold_must_be_numeric():
+    c = contract_skeleton()
+    c["tasks"]["effectiveness_gate"]["threshold"] = "abc"
+    assert any("threshold" in p for p in validate_contract(c))
+
+
+def test_seeds_must_be_int_list():
+    c = contract_skeleton()
+    c["tasks"]["main"][0]["seeds"] = ["x"]
+    assert any("seeds" in p for p in validate_contract(c))
+    c["tasks"]["main"][0]["seeds"] = [True]  # bool 是 int 子类，显式排除
+    assert any("seeds" in p for p in validate_contract(c))
+
+
 def test_budget_must_be_positive_ints():
     c = contract_skeleton()
     c["budget"]["llm_tokens_total"] = -1

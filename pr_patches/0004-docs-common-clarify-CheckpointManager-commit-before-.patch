@@ -1,0 +1,48 @@
+From 327e03092ee17fe6d9e878335e0dc464e2952327 Mon Sep 17 00:00:00 2001
+From: wsx676 <344365843@qq.com>
+Date: Wed, 26 Aug 2026 19:54:12 +0800
+Subject: [PATCH] docs(common): clarify CheckpointManager commit-before-state
+ ordering (PR2 review)
+
+---
+ jiuwenswarm/common/checkpoint.py | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/jiuwenswarm/common/checkpoint.py b/jiuwenswarm/common/checkpoint.py
+index 3824f9d..ff3936f 100644
+--- a/jiuwenswarm/common/checkpoint.py
++++ b/jiuwenswarm/common/checkpoint.py
+@@ -44,8 +44,11 @@ class CheckpointManager:
+ 
+     Args:
+         checkpoint_dir: Directory holding ``checkpoint_state.json``.
+-        commit_fn: Optional hook invoked after each state write; its
+-            return value is stored as the task's revision id.
++        commit_fn: Optional hook invoked *before* the state entry is
++            persisted (the revision id it returns is recorded into the
++            entry).  A crash between the commit and the state write
++            biases toward re-running the task (duplicate commit), which
++            is the safe side for idempotent tasks.
+     """
+ 
+     def __init__(self, checkpoint_dir: Path | str,
+@@ -65,10 +68,13 @@ class CheckpointManager:
+ 
+     def mark_done(self, task_id: str, message: str = "",
+                   extra: Optional[Dict] = None) -> Optional[str]:
+-        """Persist completion of ``task_id`` atomically, then commit.
++        """Commit (to obtain a revision id), then persist state atomically.
+ 
+-        Idempotent: re-marking returns the stored revision without
+-        rewriting state or re-invoking the commit hook.
++        Order note: the commit hook runs first because its return value
++        is recorded in the state entry.  A crash between the two steps
++        leaves the task un-marked (it will be re-run on resume and
++        re-committed); callers with non-idempotent tasks should account
++        for this small window.  Re-marking a completed task is a no-op.
+         """
+         if task_id in self._state:
+             return self._state[task_id].get("revision")
+-- 
+2.51.0.windows.1
+
