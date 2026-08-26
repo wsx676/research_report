@@ -7,6 +7,8 @@
 """
 import json
 
+import pytest
+
 import minifars.survey as survey
 from minifars.artifacts import parse_proposal
 from minifars.pipeline import StageContext, stage_ideation
@@ -127,6 +129,41 @@ class TestIdeationLoop:
                            .read_text(encoding="utf-8"))
         assert hypos["source"] == "hypothesis_agent_refine"
         assert "修订" in hypos["hypotheses"][0]["title"]
+
+    def test_full_loop_raises_when_all_hard_checks_fail(self, tmp_path, monkeypatch, fake_llm):
+        """评审修复：全员硬检查失败 → 熔断 withholding → 清晰 RuntimeError，
+        不得放行违反域约束的候选。"""
+        _mock_search(monkeypatch)
+        items = _hypo_items()
+        revised = _hypo_items(tag="（修订）")
+        bad_gate = json.dumps([{
+            "id": it["id"],
+            "scores": {"novelty": 0.9, "verifiability": 0.9,
+                       "compute_feasibility": 0.9, "boundary_clarity": 0.9},
+            "automation_ok": True, "budget_ok": False, "rationale": "超预算",
+        } for it in items], ensure_ascii=False)
+        light = fake_llm(["## compression\n- 空白点1"])
+        strong = fake_llm([
+            json.dumps(items, ensure_ascii=False), _peer_json(items), bad_gate,
+            json.dumps(revised, ensure_ascii=False), _peer_json(revised), bad_gate,
+            json.dumps(revised, ensure_ascii=False), _peer_json(revised), bad_gate,
+        ])
+        with pytest.raises(RuntimeError, match="无候选过门"):
+            stage_ideation(_ctx(tmp_path, strong, light))
+
+    def test_full_loop_raises_on_unparseable_hypotheses(self, tmp_path, monkeypatch, fake_llm):
+        """评审修复：LLM 未产出可解析假设（thinking 吃满预算）→ 空批次计入
+        熔断预算，3 轮后清晰 RuntimeError 而非 accept 崩溃。"""
+        _mock_search(monkeypatch)
+        light = fake_llm(["## compression\n- 空白点1"])
+        only_thinking = "[only thinking, no text; 建议增大 max_tokens] 思考中……"
+        strong = fake_llm([
+            only_thinking, "[]", "[]",          # generate/peer/gate r1
+            only_thinking, "[]", "[]",          # refine/peer/gate r2
+            only_thinking, "[]", "[]",          # refine/peer/gate r3
+        ])
+        with pytest.raises(RuntimeError, match="无候选过门"):
+            stage_ideation(_ctx(tmp_path, strong, light))
 
     def test_dry_run_writes_placeholder_accepted(self, tmp_path):
         ctx = StageContext(project=tmp_path, topic=TOPIC, dry_run=True)

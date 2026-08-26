@@ -114,3 +114,34 @@ class TestSurveyAgentRun:
         cards = json.loads((tmp_path / "survey" / "survey_cards.json")
                            .read_text(encoding="utf-8"))
         assert cards["cards"] == []
+
+    def test_legitimately_empty_s2_does_not_skip_later_directions(
+            self, tmp_path, monkeypatch):
+        """评审修复：合法空检索不触发降级跳过（与限流区分）。"""
+        calls = []
+
+        def fake_s2(q, **kw):
+            calls.append(q)
+            return []  # 成功但无命中
+
+        monkeypatch.setattr(survey, "search_arxiv", lambda q, **kw: [])
+        monkeypatch.setattr(survey, "search_semantic_scholar", fake_s2)
+        topic = {**self.TOPIC, "sub_directions": ["d1", "d2"]}
+        SurveyAgent(topic, None, out_dir=tmp_path / "survey").run()
+        assert calls == ["d1", "d2"]
+
+    def test_s2_degradation_skips_later_directions(self, tmp_path, monkeypatch,
+                                                   capsys):
+        """评审修复：S2DegradedError 才触发降级，后续方向跳过 S2。"""
+        calls = []
+
+        def fake_s2(q, **kw):
+            calls.append(q)
+            raise survey.S2DegradedError("S2 持续 429 限流，重试耗尽")
+
+        monkeypatch.setattr(survey, "search_arxiv", lambda q, **kw: [])
+        monkeypatch.setattr(survey, "search_semantic_scholar", fake_s2)
+        topic = {**self.TOPIC, "sub_directions": ["d1", "d2", "d3"]}
+        SurveyAgent(topic, None, out_dir=tmp_path / "survey").run()
+        assert calls == ["d1"]  # 确认降级后跳过其余方向
+        assert "S2 降级" in capsys.readouterr().out

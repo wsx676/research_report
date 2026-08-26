@@ -7,12 +7,18 @@ D2 起各 Swarm 子 Agent 统一经 LLMClient.chat() 访问模型，禁止绕过
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 from .config import TierModel
 from .metering import MeteringMiddleware
+
+#: 可重试的服务端状态码（限流 + 瞬时故障）
+RETRYABLE_STATUS = (429, 500, 502, 503)
+#: 每次重试前的退避秒数（订阅制端点限流是常态，退避后通常恢复）
+RETRY_BACKOFFS = (5.0, 15.0)
 
 
 class LLMError(RuntimeError):
@@ -53,20 +59,35 @@ class LLMClient:
             payload["system"] = system
 
         def _call() -> Dict[str, Any]:
-            resp = httpx.post(
-                f"{self.api_base}/v1/messages",
-                headers={"x-api-key": self.api_key,
-                         "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json=payload, timeout=self.timeout,
-            )
-            if resp.status_code != 200:
-                raise LLMError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-            data = resp.json()
-            base = data.get("base_resp") or {}
-            if base.get("status_code") not in (0, None):
-                raise LLMError(f"base_resp {base.get('status_code')}: {base.get('status_msg')}")
-            return data
+            """单次调用，对限流/瞬时故障做有限次退避重试（RETRY_BACKOFFS）：
+            一次 429 不应作废整段流水线的既有 token 消耗。"""
+            for attempt in range(len(RETRY_BACKOFFS) + 1):
+                try:
+                    resp = httpx.post(
+                        f"{self.api_base}/v1/messages",
+                        headers={"x-api-key": self.api_key,
+                                 "anthropic-version": "2023-06-01",
+                                 "content-type": "application/json"},
+                        json=payload, timeout=self.timeout,
+                    )
+                except httpx.TimeoutException as exc:
+                    if attempt < len(RETRY_BACKOFFS):
+                        time.sleep(RETRY_BACKOFFS[attempt])
+                        continue
+                    raise LLMError(f"超时（重试耗尽）: {exc}") from exc
+                if (resp.status_code in RETRYABLE_STATUS
+                        and attempt < len(RETRY_BACKOFFS)):
+                    time.sleep(RETRY_BACKOFFS[attempt])
+                    continue
+                if resp.status_code != 200:
+                    raise LLMError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+                data = resp.json()
+                base = data.get("base_resp") or {}
+                if base.get("status_code") not in (0, None):
+                    raise LLMError(f"base_resp {base.get('status_code')}: "
+                                   f"{base.get('status_msg')}")
+                return data
+            raise LLMError("unreachable")  # for 循环必然 return/raise
 
         wrapped = self.metering.wrap(
             _call, stage=self.stage, agent=self.agent, model=self.model.name)

@@ -28,6 +28,13 @@ from .llm import LLMClient
 ARXIV_API = "https://export.arxiv.org/api/query"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
 
+
+class S2DegradedError(RuntimeError):
+    """Semantic Scholar 辅源不可用（429 限流/网络失败重试耗尽）。
+
+    与"成功但无命中"区分：合法空检索不应触发后续方向的跳过。"""
+
+
 #: 每子方向从每个源最多取多少篇
 PER_DIRECTION_LIMIT = 8
 #: 卡片摘要截断（上下文压缩红线）
@@ -126,7 +133,8 @@ def search_arxiv(query: str, max_results: int = PER_DIRECTION_LIMIT,
 def search_semantic_scholar(query: str, limit: int = PER_DIRECTION_LIMIT,
                             api_key: Optional[str] = None,
                             timeout: float = 30.0) -> List[Paper]:
-    """S2 检索：429/网络异常时返回空列表（辅源静默降级，不阻塞主流程）。"""
+    """S2 检索：429/网络异常重试耗尽时抛 S2DegradedError（与"合法空结果"
+    区分），成功但无命中返回空列表。"""
     headers = {"x-api-key": api_key} if api_key else {}
     for attempt, backoff in enumerate(S2_BACKOFF_SECONDS + (0,)):
         try:
@@ -140,13 +148,13 @@ def search_semantic_scholar(query: str, limit: int = PER_DIRECTION_LIMIT,
                 continue
             r.raise_for_status()
             break
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             if backoff:
                 time.sleep(backoff)
                 continue
-            return []
+            raise S2DegradedError(f"S2 检索失败: {exc}") from exc
     else:
-        return []
+        raise S2DegradedError("S2 持续 429 限流，重试耗尽")
     papers: List[Paper] = []
     for item in r.json().get("data", []):
         ext = item.get("externalIds") or {}
@@ -202,13 +210,19 @@ class SurveyAgent:
                 group = search_arxiv(direction)
             except httpx.HTTPError as exc:
                 print(f"[survey] arXiv '{direction}' 失败: {exc}")
-            # 无 key 且已确认限流：跳过后续方向的 S2 重试（省退避等待）
+            # 无 key 且已确认限流：跳过后续方向的 S2 重试（省退避等待）。
+            # 降级信号来自 S2DegradedError，合法空结果不触发跳过。
             if s2_degraded and not self.s2_api_key:
                 s2_hits: List[Paper] = []
             else:
-                s2_hits = search_semantic_scholar(direction, api_key=self.s2_api_key)
-                if not s2_hits:
+                try:
+                    s2_hits = search_semantic_scholar(direction,
+                                                      api_key=self.s2_api_key)
+                except S2DegradedError as exc:
+                    s2_hits = []
                     s2_degraded = True
+                    if not self.s2_api_key:
+                        print(f"[survey] S2 降级（{exc}），后续方向跳过 S2")
             merged = merge_papers([group, s2_hits])
             merged = filter_recent(merged, months_back)
             if min_citations > 0:

@@ -92,6 +92,13 @@ def stage_ideation(ctx: StageContext, client: Optional[LLMClient] = None) -> Dic
             hypo.refine(peer_res["items"], gate_feedback={
                 "weighted": decision.weighted, "reason": decision.reason,
                 "threshold": gate.threshold})
+    if not decision.passed:
+        # 循环耗尽仍无候选过门：全员硬检查失败（熔断 withholding）或
+        # LLM 未产出可解析假设（空批次）。报清晰错误而非崩溃于 accept。
+        raise RuntimeError(
+            "Ideation 无候选过门（含熔断 withholding）："
+            f"最后判定={decision.reason!r}；"
+            "请检查 LLM 输出可解析性、max_tokens 预算或主题预算约束")
     accepted = gate.accept(decision, produced["hypotheses"])
 
     # 主制品（ctx.artifacts['ideation']）= accepted_proposal.md，

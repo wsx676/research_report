@@ -1,0 +1,114 @@
+From f1ee6d4416ba176bad81bde57495ae205d21f662 Mon Sep 17 00:00:00 2001
+From: wsx676 <344365843@qq.com>
+Date: Wed, 26 Aug 2026 08:40:25 +0800
+Subject: [PATCH 2/2] fix(common): QualityGate breaker hardens against
+ degenerate inputs (PR1 review)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+评审修复两处熔断器边界缺陷：
+- 空候选批次计入熔断预算（此前空批次旁路计数器，退化上游可使流水线
+  空转死循环）；空池永不强制放行；
+- 熔断触发时若无硬检查干净的候选则 withholding（此前回落脏池强制放行
+  违反域约束的高分候选，与文档'Hard-check failures still block'矛盾）；
+  计数器保持 armed，后续干净候选仍可被强制放行；
+- 补 2 个边界单测（空批次×熔断、全员硬检查失败×熔断），21/21 通过。
+---
+ jiuwenswarm/common/quality_gate.py           | 25 +++++++++++---
+ tests/unit_tests/common/test_quality_gate.py | 35 ++++++++++++++++++++
+ 2 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/jiuwenswarm/common/quality_gate.py b/jiuwenswarm/common/quality_gate.py
+index 096499b..49d8823 100644
+--- a/jiuwenswarm/common/quality_gate.py
++++ b/jiuwenswarm/common/quality_gate.py
+@@ -192,6 +192,11 @@ class QualityGate:
+         ``config.max_iterations`` consecutive rounds without acceptance.
+         """
+         if not candidates:
++            # An empty batch also counts as a failing round: it consumes the
++            # circuit-breaker budget, so a degraded upstream (e.g. an LLM that
++            # produced no parseable candidates) cannot spin the pipeline
++            # forever.  The empty pool is never force accepted.
++            self._consecutive_failures += 1
+             decision = GateDecision(False, None, False, "no candidates submitted",
+                                     iteration=iteration)
+             self._persist(decision, candidates, record_payload)
+@@ -215,12 +220,22 @@ class QualityGate:
+                              and self._consecutive_failures >= self.config.max_iterations)
+             if breaker_armed:
+                 # Circuit breaker: force accept the best draft to avoid an
+-                # endless refine loop. Hard-check failures still block —
+-                # pick the highest scorer among hard-check-clean candidates,
+-                # falling back to the global best when none qualify.
++                # endless refine loop.  Hard checks still dominate: when every
++                # candidate violates a hard constraint (e.g. budget or policy
++                # compliance), withholding is safer than shipping an
++                # infeasible draft — the counter stays armed so a later round
++                # with a clean candidate can still be force accepted.
+                 clean = [c for c in candidates if not hard_failures[c.id]]
+-                pool = clean or candidates
+-                winner = max(pool, key=lambda c: weighted[c.id])
++                if not clean:
++                    decision = GateDecision(
++                        False, None, False,
++                        f"circuit breaker withheld: all {len(candidates)} "
++                        f"candidates fail hard checks",
++                        weighted=weighted, hard_check_failures=hard_failures,
++                        iteration=iteration)
++                    self._persist(decision, candidates, record_payload)
++                    return decision
++                winner = max(clean, key=lambda c: weighted[c.id])
+                 forced = True
+                 reason = (f"circuit breaker after {self._consecutive_failures} "
+                           f"rounds without acceptance; force accepted best draft")
+diff --git a/tests/unit_tests/common/test_quality_gate.py b/tests/unit_tests/common/test_quality_gate.py
+index aa68ac0..7829ca6 100644
+--- a/tests/unit_tests/common/test_quality_gate.py
++++ b/tests/unit_tests/common/test_quality_gate.py
+@@ -150,6 +150,41 @@ class TestCircuitBreaker:
+             decision = gate.review([weak])
+         assert not decision.passed and not decision.forced
+ 
++    def test_empty_batch_consumes_breaker_budget(self, ideation_gate):
++        """退化输入（空批次）消耗熔断预算：永不强制放行空池，但计数器
++        持续累计，避免上游降级时流水线空转死循环。"""
++        for iteration in (1, 2, 3):
++            decision = ideation_gate.review([], iteration=iteration)
++            assert not decision.passed and not decision.forced
++        # 第 4 轮空批次仍处于 armed 状态（依旧不放行空池）
++        assert not ideation_gate.review([], iteration=4).forced
++        # 干净高分候选进来立即过门并复位计数器
++        good = Candidate("H9", {d.name: 0.9 for d in
++                                GateConfig.ideation_default().dimensions})
++        decision = ideation_gate.review([good], iteration=5)
++        assert decision.passed and not decision.forced
++
++    def test_breaker_withholds_when_all_hard_checks_fail(self):
++        """熔断不得放行全员硬检查失败的候选（域约束优先于防死循环）；
++        计数器保持 armed，后续轮次的干净候选仍可被强制放行。"""
++        config = GateConfig(dimensions=[RubricDimension("a")],
++                            threshold=0.9, max_iterations=3,
++                            hard_checks={"within_budget":
++                                         lambda c: bool(c.payload.get("ok"))})
++        gate = QualityGate(config)
++        dirty = Candidate("c1", {"a": 0.99}, payload={"ok": False})
++        clean = Candidate("c2", {"a": 0.2}, payload={"ok": True})
++        for iteration in (1, 2, 3):
++            decision = gate.review([dirty], iteration=iteration)
++        assert not decision.passed and not decision.forced
++        assert "withheld" in decision.reason
++        # 再来一轮脏候选：仍然 withholding
++        assert not gate.review([dirty], iteration=4).passed
++        # 干净低分候选进来：熔断强制放行它而非脏高分候选
++        decision = gate.review([dirty, clean], iteration=5)
++        assert decision.passed and decision.forced
++        assert decision.candidate_id == "c2"
++
+ 
+ # --------------------------------------------------------------- records
+ class TestRecords:
+-- 
+2.51.0.windows.1
+

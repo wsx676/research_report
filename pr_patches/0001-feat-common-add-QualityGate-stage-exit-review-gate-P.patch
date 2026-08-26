@@ -1,7 +1,8 @@
 From 105c6a60f4719e3109cafdf3642901640e2b5036 Mon Sep 17 00:00:00 2001
 From: wsx676 <344365843@qq.com>
 Date: Tue, 25 Aug 2026 17:30:42 +0800
-Subject: [PATCH] feat(common): add QualityGate stage-exit review gate (PR1)
+Subject: [PATCH 1/2] feat(common): add QualityGate stage-exit review gate
+ (PR1)
 
 - configurable rubric (weighted dimensions), threshold gate, named hard checks
 
