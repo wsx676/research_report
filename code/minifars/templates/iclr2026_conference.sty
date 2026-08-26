@@ -1,0 +1,38 @@
+%% iclr2026_conference.sty —— miniFARS vendored 轻量 ICLR 会议版式（§5.4 Step2）。
+%% 目标：与 ICLR 提交版式同构（标题块/单栏/摘要/natbib 引用），
+%% 依赖只取 TeXLive 标准包，保证 tectonic 离线 bundle 可编译。
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{iclr2026_conference}[2026/08/26 Minimal ICLR-2026-style submission format (miniFARS)]
+
+\newif\if@iclrpreprint
+\DeclareOption{preprint}{\@iclrpreprinttrue}
+\ProcessOptions\relax
+
+\RequirePackage{times}
+\RequirePackage{amsmath,amssymb}
+\RequirePackage{graphicx}
+\RequirePackage[numbers,sort&compress]{natbib}
+\RequirePackage{url}
+\RequirePackage[letterpaper,top=1in,bottom=1in,left=1.15in,right=1.15in]{geometry}
+\RequirePackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{positioning,calc}  % 方法示意图（fig2）的相对定位语法
+
+% 正文 10pt 行距对齐会议版式；段落不留白首行缩进（ICLR 习惯）
+\setlength{\parskip}{0pt}
+\setlength{\parindent}{14pt}
+
+% 页脚匿名占位（评审版不出现作者信息；preprint 选项同样匿名，
+% 定稿是否具名由 D5 提交包决定，避免评审诚信争议）
+\AtBeginDocument{%
+  \pagestyle{plain}%
+}
+
+% 摘要环境收紧宽度（article 自带 abstract，此处仅调字号间距）
+\renewenvironment{abstract}{%
+  \centerline{\large\bfseries Abstract}\vspace{0.5ex}\begin{quote}\small
+}{%
+  \end{quote}\vspace{1ex}%
+}
+
+\endinput

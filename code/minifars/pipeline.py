@@ -18,11 +18,14 @@ from typing import Dict, Optional
 import yaml
 
 from . import STAGES
+from .analysis import AnalysisAgent
 from .artifacts import (blueprint_skeleton, proposal_front_matter,
                         write_proposal)
 from .config import PipelineConfig, load_env
 from .contract import contract_skeleton, save_contract
+from .draft import DraftAgent
 from .experiment import run_experiment_stage
+from .format_check import FormatAgent
 from .gate import GateAgent
 from .hypothesis import HypothesisAgent
 from .llm import LLMClient, build_client
@@ -151,17 +154,44 @@ def stage_experiment(ctx: StageContext, client: Optional[LLMClient]) -> Dict[str
 
 
 def stage_writing(ctx: StageContext, client: Optional[LLMClient]) -> Dict[str, str]:
-    """Writing Swarm（D4 实装）：blueprint.json → draft.tex → final.pdf。"""
+    """Writing Swarm（§5.4，D4 实装）：制品证据 → blueprint.json → draft.tex → PDF。
+
+    AnalysisAgent 证据审计（无证据不入蓝图）→ DraftAgent 按蓝图逐节写作
+    （引用只取自 Survey 文献卡片，CitationChecker 逐条校验）→ FormatAgent
+    编译 + BibTeX/数值一致性审计。负结果按 candid analysis 诚实成文。
+    """
     paper_dir = ctx.project / STAGE_DIRS["writing"]
-    bp = blueprint_skeleton(title=f"Toward {ctx.topic.get('name')}",
-                            central_claim="[D4] 由 AnalysisAgent 从制品证据提炼")
-    bp_path = paper_dir / "blueprint.json"
-    bp_path.write_text(json.dumps(bp, ensure_ascii=False, indent=2), encoding="utf-8")
-    (paper_dir / "draft.tex").write_text(
-        "% miniFARS draft —— D4 由 DraftAgent 按蓝图逐节写作\n"
-        "\\documentclass{article}\n\\begin{document}\n\\title{placeholder}\n"
-        "\\maketitle\n\\end{document}\n", encoding="utf-8")
-    return {"blueprint": str(bp_path)}
+    paper_dir.mkdir(parents=True, exist_ok=True)  # 幂等：支持脱离编排器单测
+    if ctx.dry_run:
+        bp = blueprint_skeleton(title=f"Toward {ctx.topic.get('name')}",
+                                central_claim="[dry-run] 占位中心论点")
+        bp["claims"] = [{
+            "id": "C1", "text": "[dry-run] placeholder claim",
+            "section": "introduction",
+            "evidence": [{"source_artifact": "topic.yaml",
+                          "figure_candidate": None,
+                          "support_strength": "weak"}]}]
+        bp_path = paper_dir / "blueprint.json"
+        bp_path.write_text(json.dumps(bp, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+        (paper_dir / "draft.tex").write_text(
+            "% miniFARS draft —— dry-run 占位（真实运行由 DraftAgent 产出）\n"
+            "\\documentclass{article}\n\\begin{document}\n\\title{placeholder}\n"
+            "\\maketitle\n\\end{document}\n", encoding="utf-8")
+        return {"blueprint": str(bp_path)}
+
+    contract_path = ctx.artifacts.get("planning") or str(
+        ctx.project / STAGE_DIRS["planning"] / "experiment_contract.yaml")
+    analysis = AnalysisAgent(ctx.topic, ctx.llm_strong, ctx.project,
+                             paper_dir, metering=ctx.metering)
+    produced = analysis.run(contract_path)
+    drafter = DraftAgent(ctx.topic, ctx.llm_strong, ctx.project,
+                         paper_dir, metering=ctx.metering)
+    produced.update(drafter.run(produced["blueprint"]))
+    fmt = FormatAgent(ctx.project, paper_dir, metering=ctx.metering)
+    report = fmt.run(draft_path=produced["draft"], bib_path=produced["bib"])
+    produced["pdf"] = report["pdf"]
+    return produced
 
 
 STAGE_FUNCS = {

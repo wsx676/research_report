@@ -1,0 +1,205 @@
+From de6888d93849718c709e97a40722f3f0cf5556d4 Mon Sep 17 00:00:00 2001
+From: wsx676 <344365843@qq.com>
+Date: Wed, 26 Aug 2026 21:30:10 +0800
+Subject: [PATCH] feat(common): add AcademicFormatValidator manuscript
+ integrity audits (PR3)
+
+Domain-agnostic pre-submission audits for generated papers: number-consistency (every decimal must be in a caller-supplied sanctioned registry), citation whitelist vs BibTeX database, and abstract presence/word-limit. Guards the FARS internal-consistency failure mode (numbers mixed across runs) and hallucinated citations. Consumed by miniFARS FormatAgent.
+---
+ jiuwenswarm/common/academic_format.py         | 124 ++++++++++++++++++
+ .../unit_tests/common/test_academic_format.py |  52 ++++++++
+ 2 files changed, 176 insertions(+)
+ create mode 100644 jiuwenswarm/common/academic_format.py
+ create mode 100644 tests/unit_tests/common/test_academic_format.py
+
+diff --git a/jiuwenswarm/common/academic_format.py b/jiuwenswarm/common/academic_format.py
+new file mode 100644
+index 0000000..3584bef
+--- /dev/null
++++ b/jiuwenswarm/common/academic_format.py
+@@ -0,0 +1,124 @@
++# -*- coding: utf-8 -*-
++"""Integrity audits for automatically generated academic manuscripts.
++
++Generated-paper pipelines are exposed to well-known failure modes:
++fabricated numbers drifting in from earlier runs, citations that do
++not exist, and abstracts that violate venue limits.  This module
++provides three domain-agnostic, purely textual audits that a writing
++stage can run *before* submission:
++
++Features
++--------
++- Number-consistency audit: every decimal in the manuscript must be a
++  member of a caller-supplied registry of sanctioned values (typically
++  derived from persisted experiment results).  Catches mixing numbers
++  across runs or LLM-invented figures.
++- Citation audit: every ``\\cite`` key used in the manuscript must
++  exist in the generated BibTeX database (hallucinated-reference
++  guard).
++- Abstract audit: presence and word-limit compliance of the abstract
++  environment.
++
++The audits are engine-agnostic (plain regex over LaTeX source); the
++caller decides what counts as a sanctioned number and how violations
++are handled (block vs. report).
++
++Example (writing-stage gate)::
++
++    v = AcademicFormatValidator()
++    for score in experiment_scores:
++        v.register_number(score)
++    problems = v.validate(tex_text, bib_text)
++    if problems:
++        raise RuntimeError(f"manuscript integrity audits failed: {problems}")
++"""
++from __future__ import annotations
++
++import re
++from typing import Any, Iterable, List, Union
++
++#: Decimals with 2-4 fractional digits, not embedded in identifiers.
++#: Lookahead only rejects further digits (longer decimals); a trailing
++#: sentence period still lets the value match.
++FLOAT_RE = re.compile(r"(?<![\w.])\d+\.\d{2,4}(?!\d)")
++#: \cite / \citep / \citet key groups (comma-separated allowed).
++CITE_RE = re.compile(r"\\cite[pt]?\{([^}]+)\}")
++ABSTRACT_RE = re.compile(r"\\begin\{abstract\}(.*?)\\end\{abstract\}", re.S)
++
++DEFAULT_ABSTRACT_WORD_LIMIT = 250
++
++
++def audit_numbers(text: str, registry: Iterable[str]) -> List[str]:
++    """Flag decimals in ``text`` absent from the sanctioned ``registry``.
++
++    An empty registry disables the audit (e.g. dry runs without
++    experiment results).  Returns one message per offending value.
++    """
++    registry = set(registry)
++    if not registry:
++        return []
++    offenders = sorted(set(FLOAT_RE.findall(text)) - registry)
++    return [f"unregistered number {v} (not in sanctioned value set)"
++            for v in offenders]
++
++
++def audit_citations(text: str, bib_text: str) -> List[str]:
++    """Flag ``\\cite`` keys not defined in the BibTeX database."""
++    cited: List[str] = []
++    for group in CITE_RE.findall(text):
++        cited.extend(k.strip() for k in group.split(","))
++    bib_keys = set(re.findall(r"@\w+\{([^,\s]+),", bib_text))
++    return [f"citation {k} missing from references database"
++            for k in dict.fromkeys(cited) if k not in bib_keys]
++
++
++def audit_abstract(text: str,
++                   word_limit: int = DEFAULT_ABSTRACT_WORD_LIMIT) -> List[str]:
++    """Require an abstract environment within the word limit."""
++    m = ABSTRACT_RE.search(text)
++    if not m:
++        return ["abstract environment missing"]
++    words = re.findall(r"\w+", re.sub(r"\\[a-zA-Z]+", " ", m.group(1)))
++    if len(words) > word_limit:
++        return [f"abstract has {len(words)} words, exceeds limit {word_limit}"]
++    return []
++
++
++class AcademicFormatValidator:
++    """Registry-aware manuscript integrity validator.
++
++    Args:
++        abstract_word_limit: Upper bound for abstract word count.
++
++    Number registration stores both a canonical 4-decimal form and the
++    shortest round-trip form of each value, so manuscripts may quote a
++    sanctioned number in either representation.  Derived quantities
++    (e.g. a margin computed from two registered values) must be
++    registered explicitly by the caller.
++    """
++
++    def __init__(self,
++                 abstract_word_limit: int = DEFAULT_ABSTRACT_WORD_LIMIT):
++        self.abstract_word_limit = abstract_word_limit
++        self.registry: set = set()
++
++    def register_number(self, value: Union[int, float]) -> None:
++        """Add a sanctioned numeric value (bools rejected)."""
++        if isinstance(value, bool) or not isinstance(value, (int, float)):
++            return
++        fv = float(value)
++        self.registry.add(f"{fv:.4f}")
++        self.registry.add(f"{fv:g}")
++
++    def register_numbers(self, values: Iterable[Any]) -> int:
++        """Bulk registration; returns how many values were accepted."""
++        before = len(self.registry)
++        for v in values:
++            self.register_number(v)
++        return len(self.registry) - before
++
++    def validate(self, tex_text: str, bib_text: str = "") -> List[str]:
++        """Run all audits; empty list means the manuscript passed."""
++        return (audit_citations(tex_text, bib_text) +
++                audit_numbers(tex_text, self.registry) +
++                audit_abstract(tex_text, self.abstract_word_limit))
+diff --git a/tests/unit_tests/common/test_academic_format.py b/tests/unit_tests/common/test_academic_format.py
+new file mode 100644
+index 0000000..a2b50d5
+--- /dev/null
++++ b/tests/unit_tests/common/test_academic_format.py
+@@ -0,0 +1,52 @@
++# -*- coding: utf-8 -*-
++"""Unit tests for jiuwenswarm.common.academic_format (PR3)."""
++from jiuwenswarm.common.academic_format import (
++    AcademicFormatValidator, audit_abstract, audit_citations, audit_numbers)
++
++
++def test_audit_numbers_flags_unregistered():
++    registry = {"0.6600", "0.66"}
++    problems = audit_numbers("score 0.6600 vs 0.1234", registry)
++    assert problems == ["unregistered number 0.1234 (not in sanctioned value set)"]
++    assert audit_numbers("all fine 0.6600 and 0.66", registry) == []
++
++
++def test_audit_numbers_empty_registry_disabled():
++    assert audit_numbers("any 0.9999 here", set()) == []
++
++
++def test_audit_citations_subset_rule():
++    assert audit_citations("\\cite{a,b}", "@misc{a,\n") == \
++        ["citation b missing from references database"]
++    assert audit_citations("\\citep{a}\\citet{a}", "@misc{a,\n") == []
++    assert audit_citations("no cites", "") == []
++
++
++def test_audit_abstract_presence_and_limit():
++    assert audit_abstract("\\begin{abstract}ok\\end{abstract}") == []
++    assert audit_abstract("nothing") == ["abstract environment missing"]
++    long_abs = "\\begin{abstract}" + " ".join(["w"] * 251) + "\\end{abstract}"
++    assert "exceeds limit 250" in audit_abstract(long_abs)[0]
++    assert audit_abstract(long_abs, word_limit=300) == []
++
++
++def test_validator_registers_both_forms():
++    v = AcademicFormatValidator()
++    v.register_number(0.99)
++    v.register_number(True)  # bools rejected
++    v.register_number("x")   # non-numbers rejected
++    assert v.registry == {"0.9900", "0.99"}
++
++
++def test_validator_bulk_and_validate():
++    v = AcademicFormatValidator()
++    n = v.register_numbers([0.45, 0.6, 0.66])
++    assert n > 0
++    tex = ("\\begin{abstract}main scores 0.6600.\\end{abstract}\n"
++           "see \\cite{k1}. margin 0.0600")
++    v.register_number(0.66 - 0.60)  # derived margin registered explicitly
++    assert v.validate(tex, "@article{k1,\n") == []
++    bad = v.validate(tex.replace("0.6600", "0.7777"), "@article{k1,\n")
++    assert any("0.7777" in p for p in bad)
++    bad2 = v.validate(tex, "")
++    assert any("k1" in p for p in bad2)
+-- 
+2.51.0.windows.1
+
