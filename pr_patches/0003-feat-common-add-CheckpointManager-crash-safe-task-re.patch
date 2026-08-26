@@ -1,0 +1,203 @@
+From 6f4fd84b4be2361436a032014b068de1d0175ae0 Mon Sep 17 00:00:00 2001
+From: wsx676 <344365843@qq.com>
+Date: Wed, 26 Aug 2026 16:45:32 +0800
+Subject: [PATCH] feat(common): add CheckpointManager crash-safe task resume
+ (PR2)
+
+---
+ jiuwenswarm/common/checkpoint.py           | 110 +++++++++++++++++++++
+ tests/unit_tests/common/test_checkpoint.py |  65 ++++++++++++
+ 2 files changed, 175 insertions(+)
+ create mode 100644 jiuwenswarm/common/checkpoint.py
+ create mode 100644 tests/unit_tests/common/test_checkpoint.py
+
+diff --git a/jiuwenswarm/common/checkpoint.py b/jiuwenswarm/common/checkpoint.py
+new file mode 100644
+index 0000000..3824f9d
+--- /dev/null
++++ b/jiuwenswarm/common/checkpoint.py
+@@ -0,0 +1,110 @@
++# -*- coding: utf-8 -*-
++"""Resumable task-checkpoint manager for long-running pipelines.
++
++A generic checkpoint store that lets an orchestrator survive process
++crashes/kill: every completed unit of work is persisted *before* the
++next unit starts, so a restart resumes from the last completed task
++instead of replaying the whole pipeline.
++
++Features
++--------
++- Atomic state persistence (tmp file + ``os.replace``): a crash in the
++  middle of a write never corrupts the checkpoint file.
++- Optional commit hook: callers pass ``commit_fn`` to checkpoint each
++  completion into version control (one commit per completed task),
++  keeping results and history in sync for auditability.
++- Idempotent ``mark_done``: re-marking a completed task is a no-op, so
++  replayed runs do not duplicate commits.
++
++Example (experiment orchestration)::
++
++    ckpt = CheckpointManager("exp/checkpoints",
++                             commit_fn=lambda msg: git_commit(msg))
++    for task in ckpt.pending(["E1", "B1", "M1"]):
++        run_task(task)
++        ckpt.mark_done(task)  # persists state, then commits
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++from pathlib import Path
++from typing import Callable, Dict, List, Optional
++
++STATE_FILENAME = "checkpoint_state.json"
++
++#: Signature of the commit hook: receives a commit message, returns an
++#: opaque revision id (or None).
++CommitFn = Callable[[str], Optional[str]]
++
++
++class CheckpointManager:
++    """Persist per-task completion state for crash-safe resume.
++
++    Args:
++        checkpoint_dir: Directory holding ``checkpoint_state.json``.
++        commit_fn: Optional hook invoked after each state write; its
++            return value is stored as the task's revision id.
++    """
++
++    def __init__(self, checkpoint_dir: Path | str,
++                 commit_fn: Optional[CommitFn] = None):
++        self.dir = Path(checkpoint_dir)
++        self.dir.mkdir(parents=True, exist_ok=True)
++        self.commit_fn = commit_fn
++        self._state: Dict[str, Dict] = self._load()
++
++    # ----------------------------------------------------------------- api
++    def is_done(self, task_id: str) -> bool:
++        return task_id in self._state
++
++    def pending(self, task_ids: List[str]) -> List[str]:
++        """Return ``task_ids`` filtered to not-yet-completed ones, in order."""
++        return [t for t in task_ids if t not in self._state]
++
++    def mark_done(self, task_id: str, message: str = "",
++                  extra: Optional[Dict] = None) -> Optional[str]:
++        """Persist completion of ``task_id`` atomically, then commit.
++
++        Idempotent: re-marking returns the stored revision without
++        rewriting state or re-invoking the commit hook.
++        """
++        if task_id in self._state:
++            return self._state[task_id].get("revision")
++        revision = self.commit_fn(message or f"checkpoint: {task_id}") \
++            if self.commit_fn else None
++        entry = {"finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
++                 "revision": revision}
++        if extra:
++            entry["extra"] = extra
++        self._state[task_id] = entry
++        self._flush()
++        return revision
++
++    def done(self) -> Dict[str, Dict]:
++        """Copy of the completion map (task_id -> entry)."""
++        return dict(self._state)
++
++    # ----------------------------------------------------------- internals
++    @property
++    def state_path(self) -> Path:
++        return self.dir / STATE_FILENAME
++
++    def _load(self) -> Dict[str, Dict]:
++        if not self.state_path.exists():
++            return {}
++        try:
++            data = json.loads(self.state_path.read_text(encoding="utf-8"))
++        except (json.JSONDecodeError, OSError):
++            # A corrupted state file must not trap the pipeline: start
++            # clean instead of crashing on every restart.  Callers keep
++            # results on disk, so replay cost is bounded.
++            return {}
++        return data if isinstance(data, dict) else {}
++
++    def _flush(self) -> None:
++        tmp = self.state_path.with_suffix(".tmp")
++        tmp.write_text(json.dumps(self._state, ensure_ascii=False, indent=2),
++                       encoding="utf-8")
++        os.replace(tmp, self.state_path)
+diff --git a/tests/unit_tests/common/test_checkpoint.py b/tests/unit_tests/common/test_checkpoint.py
+new file mode 100644
+index 0000000..a6dcc57
+--- /dev/null
++++ b/tests/unit_tests/common/test_checkpoint.py
+@@ -0,0 +1,65 @@
++# -*- coding: utf-8 -*-
++"""Unit tests for jiuwenswarm.common.checkpoint.CheckpointManager (PR2)."""
++import json
++
++from jiuwenswarm.common.checkpoint import STATE_FILENAME, CheckpointManager
++
++
++def test_mark_done_persists_and_filters_pending(tmp_path):
++    ckpt = CheckpointManager(tmp_path / "ckpt")
++    assert ckpt.pending(["E1", "B1", "M1"]) == ["E1", "B1", "M1"]
++    ckpt.mark_done("E1")
++    ckpt.mark_done("B1")
++    assert ckpt.is_done("E1") and ckpt.is_done("B1")
++    assert not ckpt.is_done("M1")
++    assert ckpt.pending(["E1", "B1", "M1"]) == ["M1"]
++    # state survives a fresh instance (crash-safe resume)
++    fresh = CheckpointManager(tmp_path / "ckpt")
++    assert fresh.pending(["E1", "B1", "M1"]) == ["M1"]
++    assert (tmp_path / "ckpt" / STATE_FILENAME).exists()
++
++
++def test_mark_done_invokes_commit_hook_and_stores_revision(tmp_path):
++    commits = []
++    ckpt = CheckpointManager(tmp_path / "ckpt",
++                             commit_fn=lambda msg: commits.append(msg) or "sha42")
++    revision = ckpt.mark_done("M1", message="[experiment] M1 done")
++    assert revision == "sha42"
++    assert commits == ["[experiment] M1 done"]
++    assert ckpt.done()["M1"]["revision"] == "sha42"
++
++
++def test_mark_done_is_idempotent(tmp_path):
++    commits = []
++    ckpt = CheckpointManager(tmp_path / "ckpt",
++                             commit_fn=lambda msg: commits.append(msg) or "sha1")
++    ckpt.mark_done("A1")
++    revision = ckpt.mark_done("A1")  # re-mark: no rewrite, no second commit
++    assert revision == "sha1"
++    assert len(commits) == 1
++
++
++def test_default_message_when_missing(tmp_path):
++    commits = []
++    ckpt = CheckpointManager(tmp_path / "ckpt",
++                             commit_fn=lambda msg: commits.append(msg) or None)
++    ckpt.mark_done("B2")
++    assert commits == ["checkpoint: B2"]
++
++
++def test_corrupted_state_recovers_cleanly(tmp_path):
++    d = tmp_path / "ckpt"
++    d.mkdir()
++    (d / STATE_FILENAME).write_text("{not valid json", encoding="utf-8")
++    ckpt = CheckpointManager(d)
++    assert ckpt.pending(["E1"]) == ["E1"]  # not trapped by corruption
++    ckpt.mark_done("E1")
++    data = json.loads((d / STATE_FILENAME).read_text(encoding="utf-8"))
++    assert "E1" in data
++
++
++def test_no_tmp_file_left_behind(tmp_path):
++    ckpt = CheckpointManager(tmp_path / "ckpt")
++    ckpt.mark_done("E1")
++    leftovers = list((tmp_path / "ckpt").glob("*.tmp"))
++    assert leftovers == []
+-- 
+2.51.0.windows.1
+

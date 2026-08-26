@@ -18,16 +18,19 @@ from typing import Dict, Optional
 import yaml
 
 from . import STAGES
-from .artifacts import (blueprint_skeleton, proposal_front_matter, run_meta,
-                        write_proposal, write_result)
+from .artifacts import (blueprint_skeleton, proposal_front_matter,
+                        write_proposal)
 from .config import PipelineConfig, load_env
+from .contract import contract_skeleton, save_contract
+from .experiment import run_experiment_stage
 from .gate import GateAgent
 from .hypothesis import HypothesisAgent
 from .llm import LLMClient, build_client
 from .metering import MeteringMiddleware
 from .peer import PeerAgent
+from .planner import PlannerAgent
 from .survey import SurveyAgent
-from .workspace import STAGE_DIRS, commit_stage
+from .workspace import STAGE_DIRS, commit, commit_stage
 
 
 @dataclass
@@ -109,38 +112,42 @@ def stage_ideation(ctx: StageContext, client: Optional[LLMClient] = None) -> Dic
 
 
 def stage_planning(ctx: StageContext, client: Optional[LLMClient]) -> Dict[str, str]:
-    """Planning Swarm（D3 实装）：把 accepted_proposal 翻译为实验契约。"""
-    contract_path = ctx.project / STAGE_DIRS["planning"] / "experiment_contract.yaml"
-    contract = {
-        "schema": "v0",
-        "derived_from": ctx.artifacts.get("ideation", "proposals/P001.md"),
-        "budget": ctx.topic.get("budget", {}),
-        # 五类任务骨架（§5.2）；D3 由 PlannerAgent 填充并强校验 baselines>=2
-        "tasks": [
-            {"task_id": "t0_env", "task_type": "env_setup"},
-            {"task_id": "t1_base", "task_type": "baselines"},
-            {"task_id": "t2_main", "task_type": "main"},
-            {"task_id": "t3_gate", "task_type": "effectiveness_gate"},
-            {"task_id": "t4_analysis", "task_type": "analysis"},
-        ],
-        "dry_run": ctx.dry_run,
-    }
-    contract_path.write_text(yaml.safe_dump(contract, allow_unicode=True, sort_keys=False),
-                             encoding="utf-8")
-    return {"contract": str(contract_path)}
+    """Planning Swarm（§5.2，D3 实装）：accepted_proposal → 实验契约。
+
+    PlannerAgent 把过门立项报告翻译为 experiment_contract.yaml，
+    强校验 baselines ≥ 2、analysis ≥ 1；契约是实验设计冻结点。
+    """
+    plan_dir = ctx.project / STAGE_DIRS["planning"]
+    plan_dir.mkdir(parents=True, exist_ok=True)  # 幂等：支持脱离编排器单测
+    accepted = ctx.artifacts.get("ideation") or str(
+        ctx.project / STAGE_DIRS["ideation"] / "accepted_proposal.md")
+    if ctx.dry_run:
+        contract = contract_skeleton()
+        contract["derived_from"] = accepted
+        contract["dry_run"] = True
+        path = save_contract(contract, plan_dir / "experiment_contract.yaml")
+        print(f"[planning] dry-run 契约骨架: {path}")
+        return {"contract": str(path)}
+
+    planner = PlannerAgent(ctx.topic, ctx.llm_strong, plan_dir)
+    return planner.run(accepted)
 
 
 def stage_experiment(ctx: StageContext, client: Optional[LLMClient]) -> Dict[str, str]:
-    """Experiment Swarm（D3 实装）：按契约执行任务，指标 + run_meta 落盘。"""
-    results_dir = ctx.project / "exp" / "results"
-    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    meta = run_meta(task_id="t0_env", task_type="env_setup",
-                    command="python -V", seed=0,
-                    model=(client.model.name if client else "none"),
-                    started_at=now, finished_at=now, status="ok" if not ctx.dry_run else "dry_run",
-                    tokens={"in": 0, "out": 0})
-    paths = write_result(results_dir, "t0_env", {"placeholder": True}, meta)
-    return {"results": str(paths['metrics'].parent)}
+    """Experiment Swarm（§5.3，D3 实装）：按契约沙箱执行任务。
+
+    每任务 = 技能库模板渲染 → 沙箱执行 → 指标 + run_meta 五要素落盘；
+    main 后过有效性门（失败 → 跳过 analysis、负结果保留）；
+    CheckpointManager 每任务 git commit，支持杀进程断点续跑。
+    合成基准为确定性离线实验，dry_run 亦走完整执行链路验证引擎。
+    """
+    contract_path = ctx.artifacts.get("planning") or str(
+        ctx.project / STAGE_DIRS["planning"] / "experiment_contract.yaml")
+    summary = run_experiment_stage(
+        ctx.project, contract_path,
+        commit_fn=lambda msg: commit(ctx.project, msg),
+        metering=ctx.metering)
+    return {"results": summary["results"]}
 
 
 def stage_writing(ctx: StageContext, client: Optional[LLMClient]) -> Dict[str, str]:

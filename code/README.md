@@ -20,6 +20,9 @@ python code/main.py --topic agent_context --dry-run --smoke
 # 只跑 ideation 阶段（D2 实装：Survey + Hypothesis + Peer 质询 + Gate 打分）
 python code/main.py --topic agent_context --stages ideation
 
+# 只跑 planning + experiment 阶段（D3 实装：契约冻结 + 沙箱执行）
+python code/main.py --topic agent_context --stages planning,experiment
+
 # 单测（全离线 mock，无网络依赖）
 python -m pytest code/tests -q
 ```
@@ -40,6 +43,10 @@ python -m pytest code/tests -q
 | `minifars/hypothesis.py` | **HypothesisAgent**：空白清单 → 5~8 候选假设 P0xx.md + 辩论精炼 refine（strong 档） | §5.1 |
 | `minifars/peer.py` | **PeerAgent**：本地新颖性查重线索 + 同行质询 peer_review_r{n}.json（strong 档） | §5.1 |
 | `minifars/gate.py` | **GateAgent**：四维 rubric 打分 + 域约束硬检查，消费 PR1 QualityGate 组件（含熔断），出口 accepted_proposal.md | §5.1 |
+| `minifars/contract.py` | experiment_contract.yaml schema + 校验器（baselines≥2、analysis≥1、指标一致性） | §5.2 |
+| `minifars/planner.py` | **PlannerAgent**：accepted_proposal → 实验契约（校验失败自纠重试一次） | §5.2 |
+| `minifars/skills.py` | 策展技能库 v1：benchmark runner/多 seed/绘图/LLM-as-Judge 四模板 + 合成方法库 | §5.3 |
+| `minifars/experiment.py` | **ExperimentOrchestrator**：模板渲染 → 沙箱执行 → run_meta 落盘 + 有效性门 + 预算降级，消费 PR2 CheckpointManager 断点续跑 | §5.3 |
 | `scripts/verify_apis.py` | 文献检索 API 连通性验证（arXiv / Semantic Scholar） | §5.1 |
 
 ## 约定
@@ -57,6 +64,14 @@ python -m pytest code/tests -q
   Semantic Scholar 公共池持续 429 限流，需申请免费 API key 或降级 arXiv 单源。
 - LaTeX 工具链：tectonic 0.17.0（conda 安装于 JiuwenSwarm 环境 `Library\bin`），
   ICLR 风格冒烟编译通过（数学/表格/引用/交叉引用，产物在 `tools/latex_smoke/`，不入库）。
-- GateAgent 依赖 `jiuwenswarm.common.quality_gate`（PR1 组件）：经 JiuwenSwarm 环境
+- GateAgent 依赖 `jiuwenswarm.common.quality_gate`（PR1 组件），ExperimentOrchestrator
+  依赖 `jiuwenswarm.common.checkpoint`（PR2 组件）：均经 JiuwenSwarm 环境
   的 workswarm 可编辑安装引入，无需额外配置；Ideation 熔断语义 = 连续 3 轮无候选
   过门 → 强制放行最高分（`accepted_proposal.md` front-matter `status=forced_accept`）。
+- 实验执行（D3）：每任务 = 技能库模板渲染脚本 → subprocess 沙箱（墙钟看门狗 +
+  PermissionError 退避重试）→ `results/<task_id>.json` + `<task_id>.run_meta.json`
+  （命令/seed/模型版本/token/时间戳五要素）；每任务完成即 git commit（检查点），
+  杀进程后重跑自动从未完成任务续跑；main 后过有效性门，不支持假设 →
+  跳过 analysis 且 `negative_result.json` 完整保留负结果（FARS 算法诚实）。
+  D3 用确定性合成基准（`skills.SYNTHETIC_SCORES`）验证引擎全链路，
+  正式轮次接入真实评测数据集时扩展方法库与指标别名表即可。
